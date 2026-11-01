@@ -19,4 +19,9 @@ export const PLAYER = {
   SUBSTEP: 1 / 120,     // la física avanza en pasos de 1/120 s como máximo
   MAX_DT: 1 / 30,       // un frame nunca simula más de 1/30 s (pestaña en segundo plano)
   MAX_STEP_PX: 8,       // desplazamiento máximo por iteración (menor que un bloque)
+
+  MAX_HEALTH: 100,
+  INVULN_TIME: 1,       // s de invulnerabilidad tras recibir un golpe
+  KNOCKBACK_X: 220,     // retroceso al recibir daño (px/s)
+  KNOCKBACK_Y: 250,
 } as const;

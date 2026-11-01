@@ -6,6 +6,9 @@ export const BlockId = {
   DIRT: 1,
   STONE: 2,
   GRASS: 3,
+  COAL: 4,
+  IRON: 5,
+  GOLD: 6,
 } as const;
 
 export type BlockId = (typeof BlockId)[keyof typeof BlockId];

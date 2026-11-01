@@ -1,3 +1,4 @@
+import { BlockId } from '../core/constants';
 export const GEN = {
   // Superficie
   SURFACE_BASE: 64,        // altura media (en bloques; Y crece hacia abajo)
@@ -16,3 +17,9 @@ export const GEN = {
   CAVE_MIN_DEPTH: 12,      // por encima de esta profundidad nunca hay cuevas
   CAVE_RAMP: 16,           // bloques para pasar de "sin cuevas" a densidad plena
 } as const;
+/** Minerales: aparecen donde el ruido supera el umbral y a partir de minDepth bloques bajo la superficie. */
+export const ORES = [
+  { id: BlockId.GOLD, minDepth: 70, freq: 0.2, threshold: 0.65, offset: 3000 },
+  { id: BlockId.IRON, minDepth: 35, freq: 0.17, threshold: 0.6, offset: 2000 },
+  { id: BlockId.COAL, minDepth: 12, freq: 0.15, threshold: 0.55, offset: 1000 },
+] as const;

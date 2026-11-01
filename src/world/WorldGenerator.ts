@@ -2,7 +2,7 @@ import { createNoise2D } from 'simplex-noise';
 import { BlockId, CHUNK_SIZE } from '../core/constants';
 import { hash2D, mulberry32 } from '../core/random';
 import type { Chunk } from './Chunk';
-import { GEN } from './genParams';
+import { GEN, ORES } from './genParams';
 
 const CAVE_SALT = 0x5bd1e995;
 const DIRT_SALT = 7;
@@ -32,6 +32,17 @@ export class WorldGenerator {
       freq *= 2;
     }
     return Math.floor(GEN.SURFACE_BASE + (sum / norm) * GEN.SURFACE_AMPLITUDE);
+  }
+
+  /** Mineral en (bx, by) o null. `depth` = bloques bajo la superficie de esa columna. */
+  private oreAt(bx: number, by: number, depth: number): BlockId | null {
+    for (const ore of ORES) {
+      if (depth < ore.minDepth) continue;
+      // El ruido es global y determinista: los filones no tienen costuras entre chunks
+      const v = this.noise(bx * ore.freq + ore.offset, by * ore.freq + ore.offset * 0.7);
+      if (v > ore.threshold) return ore.id;
+    }
+    return null;
   }
 
   /**
@@ -136,6 +147,10 @@ export class WorldGenerator {
 
         if (solid && by - h >= GEN.CAVE_MIN_DEPTH && solid[ly * CHUNK_SIZE + lx] === 0) {
           id = BlockId.AIR;
+        }
+        if (id === BlockId.STONE) {
+          const ore = this.oreAt(bx, by, by - h);
+          if (ore !== null) id = ore;
         }
         chunk.blocks[ly * CHUNK_SIZE + lx] = id;
       }

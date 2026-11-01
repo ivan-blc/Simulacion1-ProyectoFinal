@@ -5,11 +5,16 @@ import {
   worldToBlock,
 } from '../core/coords';
 import { Chunk } from '../world/Chunk';
-import { GEN } from '../world/genParams';
+import { GEN, ORES } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
 import { Player } from '../player/Player';
+import { dropFor } from '../core/blockInfo';
+import { Enemy, SLIME } from '../entities/Enemy';
+import { EnemyManager } from '../entities/EnemyManager';
+import { HOTBAR_SIZE, Inventory, MAX_STACK } from '../items/Inventory';
 import type { InputState } from '../player/Player';
+
 
 function check(name: string, cond: boolean) {
   console[cond ? 'log' : 'error'](`${cond ? '✔' : '✘'} ${name}`);
@@ -311,5 +316,135 @@ export function runPhase5Tests() {
     check('alcance: bloque lejano', !p.canReach(30, 0));
     check('solapamiento: bloque dentro del jugador', p.overlapsBlock(0, 1));
     check('solapamiento: bloque bajo los pies no solapa', !p.overlapsBlock(0, 2));
+  }
+}
+
+export function runPhase6Tests() {
+  // Drops
+  check('minar pasto suelta tierra', dropFor(BlockId.GRASS) === BlockId.DIRT);
+  check('minar carbón suelta carbón', dropFor(BlockId.COAL) === BlockId.COAL);
+  check('el aire no suelta nada', dropFor(BlockId.AIR) === null);
+
+  // Inventario
+  {
+    const inv = new Inventory();
+    check('inventario nuevo: nada seleccionado', inv.selectedItem() === null);
+    check('add guarda en el primer slot', inv.add(BlockId.DIRT, 5) === 0 && inv.slots[0]?.count === 5);
+    inv.add(BlockId.DIRT, 3);
+    check('apila en el mismo slot', inv.slots[0]?.count === 8 && inv.slots[1] === null);
+    inv.add(BlockId.STONE, 1);
+    check('otro ítem usa otro slot', inv.slots[1]?.id === BlockId.STONE);
+    check('consumeSelected resta 1', inv.consumeSelected() && inv.slots[0]?.count === 7);
+    inv.select(1);
+    check(
+      'al agotar un stack, el slot queda vacío',
+      inv.consumeSelected() && inv.slots[1] === null && !inv.consumeSelected(),
+    );
+  }
+  {
+    const inv = new Inventory();
+    const left = inv.add(BlockId.DIRT, MAX_STACK * HOTBAR_SIZE + 5);
+    check('add devuelve los sobrantes si no cabe', left === 5);
+    check('inventario lleno no admite más', !inv.canAdd(BlockId.DIRT) && !inv.canAdd(BlockId.STONE));
+  }
+  {
+    const a = new Inventory();
+    a.add(BlockId.DIRT, 12);
+    a.add(BlockId.COAL, 3);
+    a.select(1);
+    const b = new Inventory();
+    check(
+      'serializar y restaurar conserva el inventario',
+      b.restore(a.serialize()) && b.selected === 1 && b.slots[0]?.count === 12 && b.slots[1]?.id === BlockId.COAL,
+    );
+    check('datos corruptos se rechazan sin romper nada', !b.restore('no es json') && b.slots[0]?.count === 12);
+    const c = new Inventory();
+    c.restore('{"slots":[[99,5],[1,0],null],"selected":50}');
+    check('ids o cantidades inválidos se descartan', c.slots.every((s) => s === null) && c.selected === 0);
+  }
+
+  // Minerales
+  const gen = new WorldGenerator(12345);
+  const world = new WorldManager((ch) => gen.generateChunk(ch));
+  const counts = new Map<number, number>();
+  for (let cy = 5; cy <= 7; cy++) {
+    for (let cx = -2; cx <= 2; cx++) {
+      const ch = world.getOrCreateChunk(cx, cy);
+      for (let i = 0; i < ch.blocks.length; i++) {
+        counts.set(ch.blocks[i], (counts.get(ch.blocks[i]) ?? 0) + 1);
+      }
+    }
+  }
+  const coal = counts.get(BlockId.COAL) ?? 0;
+  const iron = counts.get(BlockId.IRON) ?? 0;
+  const gold = counts.get(BlockId.GOLD) ?? 0;
+  check(`hay carbón en profundidad (${coal} bloques)`, coal > 0);
+  check(`hay hierro en profundidad (${iron} bloques)`, iron > 0);
+  check(`hay oro en profundidad (${gold} bloques)`, gold > 0);
+
+  const minOre = Math.min(...ORES.map((o) => o.minDepth));
+  let shallowOre = false;
+  for (let bx = -60; bx <= 60; bx++) {
+    const h = gen.surfaceHeight(bx);
+    for (let d = 0; d < minOre; d++) {
+      if (blockAt(world, bx, h + d) >= BlockId.COAL) shallowOre = true;
+    }
+  }
+  check('sin minerales cerca de la superficie', !shallowOre);
+
+  // Daño al jugador
+  {
+    const p = new Player(flatWorld());
+    p.respawn(2, 40 * BLOCK_SIZE);
+    run(p, 2, IDLE);
+    const max = p.health;
+    check('hurt resta vida y da retroceso', p.hurt(10, 1) && p.health === max - 10 && p.vx > 0 && p.vy < 0);
+    check('invulnerable justo después de un golpe', !p.hurt(10, 1) && p.health === max - 10);
+    run(p, 1.2, IDLE);
+    check('pasada la invulnerabilidad vuelve a recibir daño', p.hurt(10, -1) && p.health === max - 20);
+  }
+
+  // Slime
+  {
+    const w = flatWorld();
+    const e = new Enemy(w, 2 * BLOCK_SIZE, 40 * BLOCK_SIZE);
+    for (let i = 0; i < 120; i++) e.update(1 / 60, 0, false);
+    check(
+      'el slime cae y aterriza sobre el suelo',
+      e.onGround && Math.abs(e.y + e.height - 64 * BLOCK_SIZE) < 0.01,
+    );
+
+    const startX = e.x;
+    for (let i = 0; i < 240; i++) e.update(1 / 60, 500, true);
+    check('el slime salta hacia el jugador', e.x > startX + 20);
+
+    const dead1 = e.damage(10, 1);
+    check('un golpe no mata al slime', !dead1 && e.health === SLIME.HEALTH - 10 && e.vx > 0);
+    check('el segundo golpe lo mata', e.damage(10, 1));
+  }
+
+  // Aparición de enemigos
+  {
+    const w = flatWorld();
+    const p = landedPlayer(w);
+    const mgr = new EnemyManager(w);
+    let added = 0;
+    mgr.onAdd = () => {
+      added++;
+    };
+    mgr.update(2.1, p); // el temporizador inicial es de 2 s
+    check('el manager genera un slime', mgr.enemies.length === 1 && added === 1);
+
+    const e = mgr.enemies[0];
+    const dist = Math.abs(e.cx - (p.x + p.width / 2)) / BLOCK_SIZE;
+    check(`aparece lejos del jugador (${dist.toFixed(0)} bloques)`, dist >= 39 && dist <= 57);
+
+    for (let i = 0; i < 60; i++) mgr.update(1 / 60, p);
+    check(
+      'el slime generado queda apoyado en el suelo',
+      e.onGround && Math.abs(e.y + e.height - 64 * BLOCK_SIZE) < 0.01,
+    );
+    check('hitTest encuentra al slime', mgr.hitTest(e.cx, e.cy) === e);
+    check('hitTest lejos devuelve null', mgr.hitTest(e.cx + 200, e.cy) === null);
   }
 }

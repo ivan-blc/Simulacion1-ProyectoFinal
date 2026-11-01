@@ -10,19 +10,25 @@ export interface BlockEditorOptions {
   world: WorldManager;
 }
 
-const PLACEABLE: BlockId[] = [BlockId.DIRT, BlockId.STONE, BlockId.GRASS];
-
 export class BlockEditor {
   /** Añádelo al worldContainer, encima de los chunks. */
   readonly cursor = new Graphics();
-  selected: BlockId = BlockId.DIRT;
   hoverX = 0;
   hoverY = 0;
 
   /** Si es true, solo se puede construir junto a un bloque sólido (estilo Terraria). */
   requireSupport = false;
-  /** Hook para la Fase 5: alcance máximo y no construir dentro del jugador. */
+
+  /** Alcance, inventario lleno, no construir dentro del jugador... */
   canEdit: (bx: number, by: number, placing: boolean) => boolean = () => true;
+  /** Bloque que se colocaría ahora (null = nada que colocar). */
+  getPlaceBlock: () => BlockId | null = () => BlockId.DIRT;
+  /** Se llama tras minar con éxito. */
+  onMine: (id: BlockId) => void = () => {};
+  /** Se llama tras colocar con éxito. */
+  onPlace: () => void = () => {};
+  /** Se llama antes de editar con el punto del cursor en px del mundo. Si devuelve true, no se edita. */
+  tryInteract: (wx: number, wy: number, placing: boolean) => boolean = () => false;
 
   private readonly canvas: HTMLCanvasElement;
   private readonly worldContainer: Container;
@@ -63,11 +69,6 @@ export class BlockEditor {
       this.buttons = e.buttons;
     });
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-
-    window.addEventListener('keydown', (e) => {
-      const n = Number(e.key);
-      if (n >= 1 && n <= PLACEABLE.length) this.selected = PLACEABLE[n - 1];
-    });
   }
 
   /** Llamar una vez por frame, DESPUÉS de camera.apply(). */
@@ -78,24 +79,31 @@ export class BlockEditor {
       return;
     }
 
-    // Pantalla -> mundo usando posición y escala del contenedor, que camera.apply()
-    // acaba de fijar (más fiable que toLocal, cuya matriz global se actualiza al renderizar).
+    // Pantalla -> mundo con la posición y escala que camera.apply() acaba de fijar
     const wc = this.worldContainer;
-    const bx = worldToBlockCoord((this.sx - wc.x) / wc.scale.x);
-    const by = worldToBlockCoord((this.sy - wc.y) / wc.scale.y);
+    const wx = (this.sx - wc.x) / wc.scale.x;
+    const wy = (this.sy - wc.y) / wc.scale.y;
+    const bx = worldToBlockCoord(wx);
+    const by = worldToBlockCoord(wy);
     this.hoverX = bx;
     this.hoverY = by;
     this.cursor.position.set(bx * BLOCK_SIZE, by * BLOCK_SIZE);
 
     const mining = (this.buttons & 1) !== 0;
     const placing = !mining && (this.buttons & 2) !== 0;
-    if (mining || placing) {
-      const from = this.last ?? { x: bx, y: by };
-      this.applyLine(from.x, from.y, bx, by, placing);
-      this.last = { x: bx, y: by };
-    } else {
+    if (!mining && !placing) {
       this.last = null;
+      return;
     }
+
+    if (this.tryInteract(wx, wy, placing)) {
+      this.last = null;
+      return;
+    }
+
+    const from = this.last ?? { x: bx, y: by };
+    this.applyLine(from.x, from.y, bx, by, placing);
+    this.last = { x: bx, y: by };
   }
 
   /** Recorre los bloques entre dos puntos para que el arrastre rápido no deje huecos. */
@@ -115,11 +123,13 @@ export class BlockEditor {
     const current = this.world.getBlock(bx, by);
     if (placing) {
       if (current !== BlockId.AIR) return;
+      const item = this.getPlaceBlock();
+      if (item === null) return;
       if (this.requireSupport && !this.hasSupport(bx, by)) return;
-      this.world.setBlock(bx, by, this.selected);
+      if (this.world.setBlock(bx, by, item)) this.onPlace();
     } else {
       if (current === BlockId.AIR) return;
-      this.world.setBlock(bx, by, BlockId.AIR);
+      if (this.world.setBlock(bx, by, BlockId.AIR)) this.onMine(current);
     }
   }
 

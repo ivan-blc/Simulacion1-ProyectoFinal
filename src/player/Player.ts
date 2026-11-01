@@ -1,6 +1,6 @@
-import { BLOCK_SIZE, BlockId } from '../core/constants';
-import { blockToChunkCoord } from '../core/coords';
+import { BLOCK_SIZE } from '../core/constants';
 import type { WorldManager } from '../world/WorldManager';
+import { PhysicsBody } from './PhysicsBody';
 import { PLAYER } from './playerParams';
 
 export interface InputState {
@@ -9,31 +9,24 @@ export interface InputState {
   jump: boolean;
 }
 
-const EPS = 0.001;
-
 function approach(value: number, target: number, maxDelta: number): number {
   if (value < target) return Math.min(value + maxDelta, target);
   return Math.max(value - maxDelta, target);
 }
 
-export class Player {
-  /** Esquina superior izquierda de la caja, en píxeles del mundo. */
-  x = 0;
-  y = 0;
-  vx = 0;
-  vy = 0;
-  onGround = false;
-  readonly width: number = PLAYER.WIDTH;
-  readonly height: number = PLAYER.HEIGHT;
+export class Player extends PhysicsBody {
+  health: number = PLAYER.MAX_HEALTH;
+  readonly maxHealth: number = PLAYER.MAX_HEALTH;
+  /** Segundos de invulnerabilidad restantes tras un golpe. */
+  invuln = 0;
 
-  private readonly world: WorldManager;
   private coyote = 0;
   private jumpBuffer = 0;
   private jumpPrev = false;
   private jumping = false;
 
   constructor(world: WorldManager) {
-    this.world = world;
+    super(world, PLAYER.WIDTH, PLAYER.HEIGHT, PLAYER.AUTO_STEP);
   }
 
   respawn(x: number, y: number): void {
@@ -45,44 +38,49 @@ export class Player {
     this.coyote = 0;
     this.jumpBuffer = 0;
     this.jumping = false;
+    this.health = this.maxHealth;
+    this.invuln = 0;
   }
 
   update(dt: number, input: InputState): void {
     const clamped = Math.min(dt, PLAYER.MAX_DT);
     if (clamped <= 0) return;
 
+    if (this.invuln > 0) this.invuln = Math.max(0, this.invuln - clamped);
+
     // El salto se detecta por flanco (al pulsar), no mientras está pulsado
     if (input.jump && !this.jumpPrev) this.jumpBuffer = PLAYER.JUMP_BUFFER;
     this.jumpPrev = input.jump;
 
-    // Un frame se reparte en subpasos iguales de <= 1/120 s: la física es casi
-    // independiente de los FPS y no hay saltos visibles
+    // Un frame se reparte en subpasos iguales de <= 1/120 s
     const n = Math.ceil(clamped / PLAYER.SUBSTEP);
     const h = clamped / n;
     for (let i = 0; i < n; i++) this.step(h, input);
   }
 
-  /** ¿Está el bloque (bx, by) dentro del alcance del jugador? (distancia entre centros) */
-  canReach(bx: number, by: number): boolean {
-    const dx = (bx + 0.5) * BLOCK_SIZE - (this.x + this.width / 2);
-    const dy = (by + 0.5) * BLOCK_SIZE - (this.y + this.height / 2);
+  /** Aplica daño con retroceso. Devuelve false si estaba en invulnerabilidad o muerto. */
+  hurt(amount: number, dirX: number): boolean {
+    if (this.invuln > 0 || this.health <= 0) return false;
+    this.health = Math.max(0, this.health - amount);
+    this.invuln = PLAYER.INVULN_TIME;
+    this.vx = dirX * PLAYER.KNOCKBACK_X;
+    this.vy = -PLAYER.KNOCKBACK_Y;
+    this.onGround = false;
+    this.jumping = false;
+    return true;
+  }
+
+  /** ¿Está el punto (en píxeles del mundo) dentro del alcance del jugador? */
+  canReachPoint(px: number, py: number): boolean {
+    const dx = px - (this.x + this.width / 2);
+    const dy = py - (this.y + this.height / 2);
     const r = PLAYER.REACH_BLOCKS * BLOCK_SIZE;
     return dx * dx + dy * dy <= r * r;
   }
 
-  /** ¿Solapa el bloque (bx, by) con la caja del jugador? Rozar el borde no cuenta. */
-  overlapsBlock(bx: number, by: number): boolean {
-    return (
-      bx * BLOCK_SIZE < this.x + this.width &&
-      (bx + 1) * BLOCK_SIZE > this.x &&
-      by * BLOCK_SIZE < this.y + this.height &&
-      (by + 1) * BLOCK_SIZE > this.y
-    );
-  }
-
-  /** ¿Está la caja dentro de bloques sólidos? Útil para comprobar el punto de aparición. */
-  isOverlapping(): boolean {
-    return this.overlapsSolid(this.x, this.y);
+  /** ¿Está el bloque (bx, by) dentro del alcance? (distancia entre centros) */
+  canReach(bx: number, by: number): boolean {
+    return this.canReachPoint((bx + 0.5) * BLOCK_SIZE, (by + 0.5) * BLOCK_SIZE);
   }
 
   private step(h: number, input: InputState): void {
@@ -114,82 +112,8 @@ export class Player {
 
     this.vy = Math.min(this.vy + PLAYER.GRAVITY * h, PLAYER.MAX_FALL);
 
-    // Primero X, luego Y: cada eje se resuelve por separado
+    // Primero X, luego Y
     this.moveX(this.vx * h);
     this.moveY(this.vy * h);
-  }
-
-  /** Un chunk sin cargar cuenta como sólido: el jugador nunca cae al vacío. */
-  private isSolid(bx: number, by: number): boolean {
-    if (!this.world.getChunk(blockToChunkCoord(bx), blockToChunkCoord(by))) return true;
-    return this.world.getBlock(bx, by) !== BlockId.AIR;
-  }
-
-  private overlapsSolid(x: number, y: number): boolean {
-    const x0 = Math.floor(x / BLOCK_SIZE);
-    const x1 = Math.floor((x + this.width - EPS) / BLOCK_SIZE);
-    const y0 = Math.floor(y / BLOCK_SIZE);
-    const y1 = Math.floor((y + this.height - EPS) / BLOCK_SIZE);
-    for (let by = y0; by <= y1; by++) {
-      for (let bx = x0; bx <= x1; bx++) {
-        if (this.isSolid(bx, by)) return true;
-      }
-    }
-    return false;
-  }
-
-  private moveX(dx: number): void {
-    let remaining = dx;
-    while (remaining !== 0) {
-      const s =
-        Math.abs(remaining) > PLAYER.MAX_STEP_PX
-          ? Math.sign(remaining) * PLAYER.MAX_STEP_PX
-          : remaining;
-      remaining -= s;
-      this.x += s;
-      if (!this.overlapsSolid(this.x, this.y)) continue;
-
-      // Escalón de 1 bloque: si hay hueco para subir, sube sin saltar
-      if (PLAYER.AUTO_STEP && this.onGround && !this.overlapsSolid(this.x, this.y - BLOCK_SIZE)) {
-        this.y -= BLOCK_SIZE;
-        continue;
-      }
-
-      // Pegarse a la cara del bloque contra el que choca
-      if (s > 0) {
-        const col = Math.floor((this.x + this.width - EPS) / BLOCK_SIZE);
-        this.x = col * BLOCK_SIZE - this.width;
-      } else {
-        const col = Math.floor(this.x / BLOCK_SIZE);
-        this.x = (col + 1) * BLOCK_SIZE;
-      }
-      this.vx = 0;
-      return;
-    }
-  }
-
-  private moveY(dy: number): void {
-    this.onGround = false;
-    let remaining = dy;
-    while (remaining !== 0) {
-      const s =
-        Math.abs(remaining) > PLAYER.MAX_STEP_PX
-          ? Math.sign(remaining) * PLAYER.MAX_STEP_PX
-          : remaining;
-      remaining -= s;
-      this.y += s;
-      if (!this.overlapsSolid(this.x, this.y)) continue;
-
-      if (s > 0) {
-        const row = Math.floor((this.y + this.height - EPS) / BLOCK_SIZE);
-        this.y = row * BLOCK_SIZE - this.height;
-        this.onGround = true;
-      } else {
-        const row = Math.floor(this.y / BLOCK_SIZE);
-        this.y = (row + 1) * BLOCK_SIZE;
-      }
-      this.vy = 0;
-      return;
-    }
   }
 }

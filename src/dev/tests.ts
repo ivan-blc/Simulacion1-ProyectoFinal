@@ -133,3 +133,40 @@ export function runPhase2Tests() {
   const ratio = air / deep.blocks.length;
   check(`cuevas profundas con mezcla de aire y sólido (${(ratio * 100).toFixed(0)}% aire)`, ratio > 0.05 && ratio < 0.95);
 }
+
+export function runPhase4Tests() {
+  const gen = new WorldGenerator(12345);
+  const mk = () => new WorldManager((ch) => gen.generateChunk(ch));
+
+  const w = mk();
+  const bx = 10;
+  const by = gen.surfaceHeight(bx);
+  const pcy = blockToChunkCoord(by);
+  w.getOrCreateChunk(0, pcy);
+
+  check('antes de minar, la superficie es GRASS', w.getBlock(bx, by) === BlockId.GRASS);
+  check('minar devuelve true', w.setBlock(bx, by, BlockId.AIR));
+  check('minar aire devuelve false', !w.setBlock(bx, by, BlockId.AIR));
+
+  // Alejarse descarga el chunk; volver debe conservar la edición
+  w.update(bx + 32 * 50, by, 1);
+  check('el chunk se descarga al alejarse', w.getChunk(0, pcy) === undefined);
+  w.update(bx, by, 1);
+  check('la edición sobrevive a descargar y recargar', w.getBlock(bx, by) === BlockId.AIR);
+
+  // Ida y vuelta de persistencia (sin IndexedDB)
+  const saved = w.takeModified();
+  check('takeModified devuelve el chunk editado', saved.length === 1 && saved[0][0] === `0,${pcy}`);
+  check('takeModified vacía la cola', w.takeModified().length === 0);
+
+  const w2 = mk();
+  w2.loadEdits(new Map(saved));
+  const c2 = w2.getOrCreateChunk(0, pcy);
+  check('la edición se restaura en un mundo nuevo', w2.getBlock(bx, by) === BlockId.AIR);
+
+  const fresh = new Chunk(0, pcy);
+  gen.generateChunk(fresh);
+  let diffs = 0;
+  for (let i = 0; i < fresh.blocks.length; i++) if (fresh.blocks[i] !== c2.blocks[i]) diffs++;
+  check('solo 1 bloque difiere de la generación original', diffs === 1);
+}

@@ -1,4 +1,4 @@
-import { BlockId, CHUNK_SIZE } from '../core/constants';
+import { BLOCK_SIZE, BlockId, CHUNK_SIZE } from '../core/constants';
 import {
   blockToChunkCoord,
   blockToLocalCoord,
@@ -8,6 +8,8 @@ import { Chunk } from '../world/Chunk';
 import { GEN } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
+import { Player } from '../player/Player';
+import type { InputState } from '../player/Player';
 
 function check(name: string, cond: boolean) {
   console[cond ? 'log' : 'error'](`${cond ? '✔' : '✘'} ${name}`);
@@ -169,4 +171,145 @@ export function runPhase4Tests() {
   let diffs = 0;
   for (let i = 0; i < fresh.blocks.length; i++) if (fresh.blocks[i] !== c2.blocks[i]) diffs++;
   check('solo 1 bloque difiere de la generación original', diffs === 1);
+}
+
+const IDLE: InputState = { left: false, right: false, jump: false };
+const RIGHT: InputState = { left: false, right: true, jump: false };
+const JUMP: InputState = { left: false, right: false, jump: true };
+
+function run(p: Player, seconds: number, input: InputState): void {
+  const n = Math.round(seconds * 60);
+  for (let i = 0; i < n; i++) p.update(1 / 60, input);
+}
+
+/** Mundo con el generador plano por defecto: suelo sólido desde by = 64. */
+function flatWorld(): WorldManager {
+  const w = new WorldManager();
+  w.update(0, 64, 2);
+  return w;
+}
+
+function landedPlayer(w: WorldManager): Player {
+  const p = new Player(w);
+  p.respawn(2, 60 * BLOCK_SIZE);
+  run(p, 1, IDLE);
+  return p;
+}
+
+export function runPhase5Tests() {
+  const GROUND = 64 * BLOCK_SIZE;
+
+  // Aterrizaje
+  {
+    const p = new Player(flatWorld());
+    p.respawn(2, 40 * BLOCK_SIZE);
+    run(p, 2, IDLE);
+    check('cae y aterriza exactamente sobre el suelo', Math.abs(p.y + p.height - GROUND) < 0.01);
+    check('onGround es true al aterrizar', p.onGround);
+  }
+
+  // Muro alto: se detiene pegado a la pared
+  {
+    const w = flatWorld();
+    for (let by = 56; by < 64; by++) w.setBlock(10, by, BlockId.STONE);
+    const p = landedPlayer(w);
+    run(p, 3, RIGHT);
+    check(
+      'se detiene contra un muro de 8 bloques',
+      Math.abs(p.x + p.width - 10 * BLOCK_SIZE) < 0.01 && p.vx === 0,
+    );
+  }
+
+  // Escalón de 1 bloque: sube solo
+  {
+    const w = flatWorld();
+    for (let bx = 10; bx <= 40; bx++) w.setBlock(bx, 63, BlockId.STONE);
+    const p = landedPlayer(w);
+    run(p, 2, RIGHT);
+    check(
+      'sube sola un escalón de 1 bloque',
+      p.onGround && Math.abs(p.y + p.height - 63 * BLOCK_SIZE) < 0.01 && p.x > 10 * BLOCK_SIZE,
+    );
+  }
+
+  // Muro de 2 bloques: no lo sube sola
+  {
+    const w = flatWorld();
+    w.setBlock(10, 62, BlockId.STONE);
+    w.setBlock(10, 63, BlockId.STONE);
+    const p = landedPlayer(w);
+    run(p, 3, RIGHT);
+    check(
+      'no sube sola un muro de 2 bloques',
+      Math.abs(p.x + p.width - 10 * BLOCK_SIZE) < 0.01 && Math.abs(p.y + p.height - GROUND) < 0.01,
+    );
+  }
+
+    // Techo: el salto choca con un bloque encima
+  {
+    const w = flatWorld();
+    const p = landedPlayer(w);       // primero aterriza (y = 996)
+    w.setBlock(0, 60, BlockId.STONE); // luego aparece el techo: su cara inferior queda en y = 976
+    const groundY = p.y;
+    let minY = p.y;
+    for (let i = 0; i < 60; i++) {
+      p.update(1 / 60, JUMP);
+      minY = Math.min(minY, p.y);
+    }
+    check(
+      'el techo bloquea el salto',
+      minY >= 61 * BLOCK_SIZE - 0.01 && groundY - minY > 5,
+    );
+  }
+
+  // Altura del salto sin obstáculos
+  {
+    const p = landedPlayer(flatWorld());
+    const groundY = p.y;
+    let minY = p.y;
+    for (let i = 0; i < 60; i++) {
+      p.update(1 / 60, JUMP);
+      minY = Math.min(minY, p.y);
+    }
+    const rise = groundY - minY;
+    check(
+      `altura de salto entre 4 y 6 bloques (${(rise / BLOCK_SIZE).toFixed(1)})`,
+      rise > 4 * BLOCK_SIZE && rise < 6 * BLOCK_SIZE,
+    );
+  }
+
+  // dt enorme (pestaña en segundo plano): no atraviesa el suelo
+  {
+    const p = new Player(flatWorld());
+    p.respawn(2, 50 * BLOCK_SIZE);
+    let maxBottom = 0;
+    for (let i = 0; i < 20; i++) {
+      p.update(0.25, IDLE);
+      maxBottom = Math.max(maxBottom, p.y + p.height);
+    }
+    check('un dt enorme no atraviesa el suelo', maxBottom <= GROUND + 0.01 && p.onGround);
+  }
+
+  // Un chunk sin cargar actúa como sólido
+  {
+    const w = new WorldManager();
+    w.getOrCreateChunk(0, 0); // aire, by 0..31; el chunk (0,1) NO está cargado
+    const p = new Player(w);
+    p.respawn(2, 0);
+    run(p, 2, IDLE);
+    check(
+      'un chunk sin cargar actúa como sólido',
+      p.onGround && Math.abs(p.y + p.height - 32 * BLOCK_SIZE) < 0.01,
+    );
+  }
+
+  // Alcance y solapamiento (jugador en y = 0..28, x = 0..12)
+  {
+    const p = new Player(flatWorld());
+    p.respawn(0, 0);
+    check('alcance: bloque cercano', p.canReach(0, 1));
+    check('alcance: bloque lejano', !p.canReach(30, 0));
+    check('solapamiento: bloque dentro del jugador', p.overlapsBlock(0, 1));
+    check('solapamiento: bloque bajo los pies no solapa', !p.overlapsBlock(0, 2));
+  }
 }

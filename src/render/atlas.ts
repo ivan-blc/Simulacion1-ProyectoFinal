@@ -33,3 +33,18 @@ export function createBlockTextures(): Texture[] {
     }),
   );
 }
+
+export function createBackgroundTextures(): { sky: Texture; cave: Texture } {
+  const make = (color: string): Texture => {
+    const canvas = document.createElement('canvas');
+    canvas.width = BLOCK_SIZE;
+    canvas.height = BLOCK_SIZE;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, BLOCK_SIZE, BLOCK_SIZE);
+    const tex = Texture.from(canvas);
+    tex.source.scaleMode = 'nearest';
+    return tex;
+  };
+  return { sky: make('#6ec0ff'), cave: make('#1c1622') };
+}

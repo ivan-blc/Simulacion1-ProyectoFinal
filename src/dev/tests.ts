@@ -9,10 +9,13 @@ import { GEN, ORES } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
 import { Player } from '../player/Player';
-import { dropFor } from '../core/blockInfo';
+import { colorToNumber, dropFor } from '../core/blockInfo';
 import { Enemy, SLIME } from '../entities/Enemy';
 import { EnemyManager } from '../entities/EnemyManager';
 import { HOTBAR_SIZE, Inventory, MAX_STACK } from '../items/Inventory';
+import { ObjectPool } from '../core/ObjectPool';
+import { seedFromText } from '../core/random';
+import type { ChunkProvider } from '../world/WorldManager';
 import type { InputState } from '../player/Player';
 
 
@@ -447,4 +450,126 @@ export function runPhase6Tests() {
     check('hitTest encuentra al slime', mgr.hitTest(e.cx, e.cy) === e);
     check('hitTest lejos devuelve null', mgr.hitTest(e.cx + 200, e.cy) === null);
   }
+}
+
+/** Comprobación en vivo: un chunk generado por el worker debe ser idéntico al del hilo principal. */
+export function verifyWorkerChunk(
+  gen: WorldGenerator,
+  cx: number,
+  cy: number,
+  blocks: Uint8Array,
+  ms: number,
+): void {
+  const ref = new Chunk(cx, cy);
+  gen.generateChunk(ref);
+  check(
+    `worker: el chunk (${cx},${cy}) es idéntico al generado en el hilo principal (${ms.toFixed(1)} ms)`,
+    sameArray(ref.blocks, blocks),
+  );
+}
+
+class FakeProvider implements ChunkProvider {
+  readonly requests: string[] = [];
+  readonly cancelled: string[] = [];
+  request(cx: number, cy: number): void {
+    this.requests.push(`${cx},${cy}`);
+  }
+  cancel(cx: number, cy: number): void {
+    this.cancelled.push(`${cx},${cy}`);
+  }
+}
+
+export function runPhase7Tests() {
+  // Pool de objetos (maxIdle = 2)
+  {
+    let made = 0;
+    let destroyed = 0;
+    const pool = new ObjectPool<{ id: number }>(
+      () => ({ id: ++made }),
+      () => {
+        destroyed++;
+      },
+      2,
+    );
+    const a = pool.acquire();
+    const b = pool.acquire();
+    const c = pool.acquire();
+    check('el pool crea objetos cuando está vacío', made === 3 && pool.created === 3);
+    pool.release(a);
+    pool.release(b);
+    pool.release(c);
+    check('el pool destruye lo que supera maxIdle', destroyed === 1 && pool.idleCount === 2);
+    const d = pool.acquire();
+    check('el pool reutiliza objetos liberados', d === b && made === 3 && pool.reused === 1);
+    pool.clear();
+    check('clear destruye los objetos inactivos', destroyed === 2 && pool.idleCount === 0);
+  }
+
+  // Semillas desde texto
+  check('seedFromText: un número se respeta', seedFromText('12345', 5) === 12345);
+  check('seedFromText: vacío o null usa el valor por defecto', seedFromText('  ', 5) === 5 && seedFromText(null, 7) === 7);
+  check(
+    'seedFromText: el texto da un entero determinista y distinto por texto',
+    Number.isInteger(seedFromText('hola', 0)) &&
+      seedFromText('hola', 0) === seedFromText('hola', 0) &&
+      seedFromText('hola', 0) !== seedFromText('chau', 0),
+  );
+
+  // Colores
+  check('colorToNumber convierte #rrggbb y usa blanco si no entiende el formato', colorToNumber('#4caf50') === 0x4caf50 && colorToNumber('rgba(0,0,0,0)') === 0xffffff);
+
+  // Modo asíncrono del WorldManager (con un provider falso)
+  const fp = new FakeProvider();
+  const w = new WorldManager();
+  let loadedEvents = 0;
+  w.onChunkLoaded = () => {
+    loadedEvents++;
+  };
+  w.setProvider(fp);
+  w.update(0, 0, 1);
+  check(
+    'modo asíncrono: update solo solicita chunks, no los genera',
+    w.loadedCount === 0 && w.pendingCount === 9 && fp.requests.length === 9,
+  );
+  check('se solicita primero el chunk más cercano al jugador', fp.requests[0] === '0,0');
+  w.update(0, 0, 1);
+  check('un segundo update no repite solicitudes', fp.requests.length === 9);
+
+  const blocks = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE);
+  blocks[3] = BlockId.STONE;
+  const edits = new Map<string, Array<[number, number]>>([['1,0', [[5, BlockId.DIRT]]]]);
+  w.loadEdits(edits);
+
+  check(
+    'insertGenerated crea el chunk y avisa al render',
+    w.insertGenerated(0, 0, blocks) && w.getChunk(0, 0) !== undefined && loadedEvents === 1 && w.pendingCount === 8,
+  );
+  check('el chunk insertado conserva los datos del worker', w.getBlock(3, 0) === BlockId.STONE);
+  w.insertGenerated(1, 0, new Uint8Array(CHUNK_SIZE * CHUNK_SIZE));
+  check('las ediciones guardadas se aplican a un chunk del worker', w.getBlock(CHUNK_SIZE + 5, 0) === BlockId.DIRT);
+  check('un resultado que nadie pidió se descarta', !w.insertGenerated(9, 9, blocks) && w.getChunk(9, 9) === undefined);
+
+  w.update(CHUNK_SIZE * 10, 0, 1);
+  check(
+    'al alejarse se cancelan las solicitudes lejanas y se descargan los chunks',
+    fp.cancelled.length === 7 && w.pendingCount === 9 && w.loadedCount === 0,
+  );
+  check('un resultado tardío de un chunk cancelado se descarta', !w.insertGenerated(-1, -1, blocks));
+
+  // Generación síncrona sobre un chunk pedido, y fallback sin provider
+  const fp2 = new FakeProvider();
+  const w2 = new WorldManager();
+  w2.setProvider(fp2);
+  w2.update(0, 0, 0);
+  w2.getOrCreateChunk(0, 0);
+  check(
+    'crear un chunk de forma síncrona cancela su solicitud pendiente',
+    w2.pendingCount === 0 && fp2.cancelled[0] === '0,0' && !w2.insertGenerated(0, 0, blocks) && w2.loadedCount === 1,
+  );
+  w2.setProvider(null);
+  w2.update(CHUNK_SIZE * 5, 0, 1);
+  check(
+    'sin provider vuelve a generar de forma síncrona (fallback)',
+    w2.loadedCount === 9 && w2.loadedInArea(5, 0, 1) === 9,
+  );
 }

@@ -24,3 +24,23 @@ export function hash2D(x: number, y: number, seed: number): number {
   h ^= h >>> 16;
   return (h >>> 0) / 4294967296;
 }
+
+/**
+ * Convierte el texto de una semilla en un entero de 32 bits.
+ * Los números se respetan tal cual (la semilla 12345 sigue siendo 12345);
+ * cualquier otro texto se convierte con un hash FNV-1a determinista.
+ */
+export function seedFromText(text: string | null, fallback: number): number {
+  const t = (text ?? '').trim();
+  if (t === '') return fallback;
+  if (/^-?\d+$/.test(t)) {
+    const n = Number(t);
+    if (Number.isSafeInteger(n)) return n | 0;
+  }
+  let h = 0x811c9dc5;
+  for (let i = 0; i < t.length; i++) {
+    h ^= t.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h | 0;
+}

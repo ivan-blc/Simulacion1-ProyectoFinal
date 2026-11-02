@@ -1,7 +1,9 @@
 import { Application, Container, Graphics } from 'pixi.js';
-import { BLOCK_INFO, dropFor } from './core/blockInfo';
+import { AudioManager } from './audio/AudioManager';
+import { BLOCK_INFO, colorToNumber, dropFor } from './core/blockInfo';
 import { BLOCK_SIZE, CHUNK_SIZE } from './core/constants';
-import { worldToBlockCoord } from './core/coords';
+import { blockToChunkCoord, worldToBlockCoord } from './core/coords';
+import { seedFromText } from './core/random';
 import { showDebugMap } from './dev/debugMap';
 import { createHud } from './dev/hud';
 import {
@@ -10,6 +12,8 @@ import {
   runPhase4Tests,
   runPhase5Tests,
   runPhase6Tests,
+  runPhase7Tests,
+  verifyWorkerChunk,
 } from './dev/tests';
 import { EnemyManager } from './entities/EnemyManager';
 import { Inventory } from './items/Inventory';
@@ -20,9 +24,12 @@ import { Camera } from './render/Camera';
 import { ChunkRenderer } from './render/ChunkRenderer';
 import { Darkness } from './render/Darkness';
 import { EnemyRenderer } from './render/EnemyRenderer';
+import { Particles } from './render/Particles';
 import { createBackgroundTextures, createBlockTextures } from './render/atlas';
 import { GameUi } from './ui/GameUi';
+import { LoadingScreen, PauseMenu, showTitleScreen } from './ui/Menu';
 import { ChunkStore } from './world/ChunkStore';
+import { ChunkWorkerPool } from './world/ChunkWorkerPool';
 import { WorldGenerator } from './world/WorldGenerator';
 import { WorldManager } from './world/WorldManager';
 
@@ -30,6 +37,29 @@ const CHUNK_PX = CHUNK_SIZE * BLOCK_SIZE;
 const ATTACK_DAMAGE = 10;
 const ATTACK_COOLDOWN = 0.35; // s entre golpes
 const LIGHT_RADIUS_BLOCKS = 9;
+const PRELOAD_RADIUS = 3; // chunks que se generan antes de empezar (7x7 = 49)
+const LAST_SEED_KEY = 'terraria-pixi-last-seed';
+
+const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function readLastSeed(): string | null {
+  try {
+    return localStorage.getItem(LAST_SEED_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeLastSeed(text: string): void {
+  try {
+    localStorage.setItem(LAST_SEED_KEY, text);
+  } catch {
+    /* ignorar */
+  }
+}
+
+let loadingScreen: LoadingScreen | null = null;
 
 async function main() {
   runPhase1Tests();
@@ -37,17 +67,43 @@ async function main() {
   runPhase4Tests();
   runPhase5Tests();
   runPhase6Tests();
+  runPhase7Tests();
 
-  // ?debug = mapa 2D · ?seed=123 = semilla · ?reset = borrar cambios e inventario guardados
+  // ?debug = mapa 2D · ?autostart = saltar el menú · ?seed=123 · ?reset = borrar guardado
+  // ?noworker = generar en el hilo principal (para comparar rendimiento)
   const params = new URLSearchParams(location.search);
-  const parsed = Number(params.get('seed') ?? 12345);
-  const seed = Number.isFinite(parsed) ? parsed : 12345;
-  const reset = params.has('reset');
 
   if (params.has('debug')) {
-    showDebugMap(seed);
+    showDebugMap(seedFromText(params.get('seed'), 12345));
     return;
   }
+
+  // El audio solo se puede activar tras un gesto del usuario
+  const audio = new AudioManager();
+  const unlockAudio = () => audio.unlock();
+  window.addEventListener('pointerdown', unlockAudio, { once: true });
+  window.addEventListener('keydown', unlockAudio, { once: true });
+
+  let seed: number;
+  let reset: boolean;
+  if (params.has('autostart') || params.has('reset')) {
+    seed = seedFromText(params.get('seed'), 12345);
+    reset = params.has('reset');
+  } else {
+    const choice = await showTitleScreen(params.get('seed') ?? readLastSeed() ?? '12345', () => audio.unlock());
+    seed = choice.seed;
+    reset = choice.reset;
+    writeLastSeed(choice.seedText);
+  }
+  if (params.has('reset')) {
+    params.delete('reset'); // evita borrar de nuevo en cada recarga
+    const rest = params.toString();
+    history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : ''));
+  }
+
+  const loading = new LoadingScreen();
+  loadingScreen = loading;
+  loading.setProgress(0.03, 'Preparando el motor gráfico…');
 
   const app = new Application();
   await app.init({
@@ -62,6 +118,7 @@ async function main() {
   const world = new WorldManager((chunk) => gen.generateChunk(chunk));
 
   // Persistencia del mundo: se cargan las ediciones ANTES de crear el primer chunk
+  loading.setProgress(0.08, 'Abriendo el guardado…');
   let store: ChunkStore | null = null;
   try {
     store = await ChunkStore.open(seed);
@@ -70,11 +127,6 @@ async function main() {
   } catch (err) {
     console.warn('IndexedDB no disponible: los cambios no se guardarán', err);
     store = null;
-  }
-  if (reset) {
-    params.delete('reset'); // evita borrar de nuevo en cada recarga
-    const rest = params.toString();
-    history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : ''));
   }
 
   // Inventario (se guarda en localStorage, aparte del mundo)
@@ -124,6 +176,11 @@ async function main() {
       saving = false;
     }
   }
+  /** Espera a que termine un guardado en curso y guarda lo último (para salir al menú). */
+  async function flushNow(): Promise<void> {
+    for (let i = 0; i < 50 && saving; i++) await sleep(20);
+    await flush();
+  }
   setInterval(() => void flush(), 1000);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) void flush();
@@ -147,14 +204,44 @@ async function main() {
   world.onChunkLoaded = (chunk) => chunkRenderer.addChunk(chunk);
   world.onChunkUnloaded = (chunk) => chunkRenderer.removeChunk(chunk);
 
-  // Enemigos
+  // Generación en Web Workers (con fallback a generar en el hilo principal)
+  loading.setProgress(0.12, 'Iniciando los generadores de terreno…');
+  let pool: ChunkWorkerPool | null = null;
+  let verified = 0;
+  if (typeof Worker !== 'undefined' && !params.has('noworker')) {
+    try {
+      pool = new ChunkWorkerPool({
+        seed: gen.seed,
+        size: Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 4) - 1)),
+        onResult: (cx, cy, blocks, ms) => {
+          if (verified < 3) {
+            verified++;
+            verifyWorkerChunk(gen, cx, cy, blocks, ms);
+          }
+          world.insertGenerated(cx, cy, blocks);
+        },
+        onFatal: (err) => {
+          console.error('Fallo en un worker: se genera en el hilo principal', err);
+          world.setProvider(null);
+          ui.showMessage('Workers no disponibles: generando en el hilo principal');
+        },
+      });
+      world.setProvider(pool);
+    } catch (err) {
+      console.warn('No se pudieron crear los workers: se genera en el hilo principal', err);
+      pool = null;
+    }
+  }
+
+  // Partículas, enemigos y jugador
+  const particles = new Particles();
+
   const enemies = new EnemyManager(world);
   const enemyRenderer = new EnemyRenderer();
   enemies.onAdd = (e) => enemyRenderer.add(e);
   enemies.onRemove = (e) => enemyRenderer.remove(e);
   worldContainer.addChild(enemyRenderer.container);
 
-  // Jugador (un rectángulo por ahora)
   const player = new Player(world);
   const playerGfx = new Graphics();
   playerGfx
@@ -162,10 +249,12 @@ async function main() {
     .fill(0xf5a623)
     .stroke({ width: 1, color: 0x000000, alpha: 0.6 });
   worldContainer.addChild(playerGfx);
+  worldContainer.addChild(particles.container);
 
   // Edición con el ratón
   let freeCam = false;
   let lighting = true;
+  let debugOn = false;
   let attackCd = 0;
 
   const editor = new BlockEditor({ canvas: app.canvas, worldContainer, world });
@@ -178,12 +267,15 @@ async function main() {
     return drop === null || inventory.canAdd(drop); // inventario lleno: no se mina
   };
   editor.getPlaceBlock = () => inventory.selectedItem();
-  editor.onMine = (id) => {
+  editor.onMine = (id, bx, by) => {
     const drop = dropFor(id);
     if (drop !== null) inventory.add(drop);
+    particles.burst((bx + 0.5) * BLOCK_SIZE, (by + 0.5) * BLOCK_SIZE, colorToNumber(BLOCK_INFO[id].color));
+    audio.play('mine');
   };
   editor.onPlace = () => {
     inventory.consumeSelected();
+    audio.play('place');
   };
   // Clic izquierdo sobre un enemigo = ataque (en vez de minar el bloque que hay detrás)
   editor.tryInteract = (wx, wy, placing) => {
@@ -193,6 +285,8 @@ async function main() {
     if (attackCd <= 0 && (freeCam || player.canReachPoint(target.cx, target.cy))) {
       attackCd = ATTACK_COOLDOWN;
       const dir = target.cx >= player.x + player.width / 2 ? 1 : -1;
+      particles.burst(target.cx, target.cy, 0x4cd964, 6, 100);
+      audio.play('hit');
       if (target.damage(ATTACK_DAMAGE, dir)) enemies.remove(target);
     }
     return true;
@@ -201,14 +295,48 @@ async function main() {
   // Cámara
   const camera = new Camera(worldContainer);
 
+  /** Genera de forma SÍNCRONA los chunks alrededor de un punto (solo para aparecer/reaparecer). */
+  function forceLoadAround(bx: number, by: number, r: number): void {
+    const ccx = blockToChunkCoord(bx);
+    const ccy = blockToChunkCoord(by);
+    for (let cy = ccy - r; cy <= ccy + r; cy++) {
+      for (let cx = ccx - r; cx <= ccx + r; cx++) world.getOrCreateChunk(cx, cy);
+    }
+  }
+
   function spawnPlayer(): void {
     const surf = gen.surfaceHeight(0);
-    world.update(0, surf, 2); // el terreno bajo el jugador debe existir antes de empezar
+    forceLoadAround(0, surf, 1); // el terreno bajo el jugador debe existir ya
     player.respawn((BLOCK_SIZE - player.width) / 2, surf * BLOCK_SIZE - player.height - 1);
     for (let i = 0; i < 200 && player.isOverlapping(); i++) player.y -= BLOCK_SIZE;
     camera.x = player.x + player.width / 2;
     camera.y = player.y + player.height / 2;
   }
+
+  // Precarga del terreno de aparición con barra de progreso
+  const surf0 = gen.surfaceHeight(0);
+  camera.x = BLOCK_SIZE / 2;
+  camera.y = surf0 * BLOCK_SIZE;
+  const spawnCx = blockToChunkCoord(0);
+  const spawnCy = blockToChunkCoord(surf0);
+  const preloadTotal = (2 * PRELOAD_RADIUS + 1) ** 2;
+  const deadline = performance.now() + 20000;
+  chunkRenderer.maxBuildsPerFrame = 12; // durante la carga se pueden construir más texturas por frame
+  for (;;) {
+    world.update(0, surf0, PRELOAD_RADIUS);
+    const loaded = world.loadedInArea(spawnCx, spawnCy, PRELOAD_RADIUS);
+    const b = camera.bounds(app.screen.width, app.screen.height);
+    chunkRenderer.update(b.left, b.top, b.right, b.bottom);
+    loading.setProgress(0.2 + 0.75 * (loaded / preloadTotal), `Generando el terreno… ${loaded}/${preloadTotal}`);
+    if (loaded >= preloadTotal) break;
+    if (performance.now() > deadline) {
+      console.warn('La precarga tardó demasiado: se completa en el hilo principal');
+      forceLoadAround(0, surf0, PRELOAD_RADIUS);
+      break;
+    }
+    await nextFrame();
+  }
+  chunkRenderer.maxBuildsPerFrame = 4;
   spawnPlayer();
 
   // Iluminación (capa de pantalla, encima del mundo)
@@ -216,9 +344,43 @@ async function main() {
   app.stage.addChild(darkness.container);
   let darkLevel = 0;
 
-  // Entrada
+  // Entrada, pausa y menú
   const keys = new Set<string>();
+  let paused = false;
+
+  const pauseMenu = new PauseMenu({
+    onResume: () => setPaused(false),
+    onToggleMusic: () => audio.setMusic(!audio.musicOn),
+    onToggleSfx: () => audio.setSfx(!audio.sfxOn),
+    onQuit: () => {
+      void quitToMenu();
+    },
+  });
+
+  function setPaused(p: boolean): void {
+    paused = p;
+    keys.clear();
+    if (p) pauseMenu.show(audio.musicOn, audio.sfxOn);
+    else pauseMenu.hide();
+  }
+
+  async function quitToMenu(): Promise<void> {
+    await flushNow();
+    location.assign(location.pathname); // vuelve al menú principal (sin parámetros)
+  }
+
   window.addEventListener('keydown', (e) => {
+    if (e.key === 'F3') {
+      e.preventDefault();
+      if (!e.repeat) debugOn = !debugOn;
+      return;
+    }
+    if (e.key === 'Escape') {
+      if (!e.repeat) setPaused(!paused);
+      return;
+    }
+    if (paused) return;
+
     const k = e.key.toLowerCase();
     keys.add(k);
     if (k === ' ' || e.key.startsWith('Arrow')) e.preventDefault();
@@ -229,6 +391,10 @@ async function main() {
       lighting = !lighting;
       ui.showMessage(lighting ? 'Iluminación activada' : 'Iluminación desactivada');
     }
+    if (k === 'm') {
+      const on = audio.setMusic(!audio.musicOn);
+      ui.showMessage(on ? 'Música activada' : 'Música desactivada');
+    }
     if (/^[0-9]$/.test(e.key)) inventory.select(e.key === '0' ? 9 : Number(e.key) - 1);
   });
   window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
@@ -238,17 +404,24 @@ async function main() {
     'wheel',
     (e) => {
       e.preventDefault();
-      camera.setZoom(camera.zoom + (e.deltaY < 0 ? 1 : -1));
+      if (!paused) camera.setZoom(camera.zoom + (e.deltaY < 0 ? 1 : -1));
     },
     { passive: false },
   );
 
+  // Todo listo: se quita la pantalla de carga
+  loading.setProgress(1, 'Listo');
+  loading.hide();
+
   const input: InputState = { left: false, right: false, jump: false };
   const setHud = createHud();
   let hudTimer = 0;
+  let frameMax = 0; // el fotograma más largo desde la última actualización del HUD
 
   app.ticker.add((ticker) => {
     const dt = ticker.deltaMS / 1000;
+    frameMax = Math.max(frameMax, ticker.deltaMS);
+    if (paused) return;
     attackCd = Math.max(0, attackCd - dt);
 
     if (freeCam) {
@@ -261,8 +434,11 @@ async function main() {
       input.left = keys.has('a') || keys.has('arrowleft');
       input.right = keys.has('d') || keys.has('arrowright');
       input.jump = keys.has(' ') || keys.has('w') || keys.has('arrowup');
+
+      const hpBefore = player.health;
       player.update(dt, input);
       enemies.update(dt, player);
+      if (player.health < hpBefore) audio.play(player.health <= 0 ? 'death' : 'hurt');
 
       if (player.health <= 0) {
         enemies.clear();
@@ -280,6 +456,7 @@ async function main() {
     // Parpadeo mientras dura la invulnerabilidad
     playerGfx.alpha = player.invuln > 0 && Math.floor(player.invuln * 10) % 2 === 0 ? 0.4 : 1;
     enemyRenderer.sync();
+    particles.update(dt);
     ui.setHealth(player.health, player.maxHealth);
 
     const w = app.screen.width;
@@ -314,15 +491,37 @@ async function main() {
     if (hudTimer > 0.25) {
       hudTimer = 0;
       const under = world.getBlock(editor.hoverX, editor.hoverY);
-      setHud(
-        `FPS ${app.ticker.FPS.toFixed(0)} · chunks ${world.loadedCount} (visibles ${chunkRenderer.visibleCount}) · zoom ${camera.zoom}x\n` +
-          `jugador (${pbx}, ${pby}) · profundidad ${depth} · ${player.onGround ? 'en suelo' : 'en el aire'}\n` +
-          `cursor (${editor.hoverX}, ${editor.hoverY}) = ${BLOCK_INFO[under].name} · enemigos ${enemies.enemies.length}\n` +
-          `A/D mover · Espacio/W saltar · clic izq. minar/atacar · clic der. construir\n` +
-          `1-0 elegir slot · L luz ${lighting ? 'ON' : 'OFF'} · F cámara libre ${freeCam ? '(ACTIVA)' : ''} · R reaparecer · rueda zoom`,
-      );
+      const lines = [
+        `FPS ${app.ticker.FPS.toFixed(0)} · chunks ${world.loadedCount} (visibles ${chunkRenderer.visibleCount}) · zoom ${camera.zoom}x`,
+        `jugador (${pbx}, ${pby}) · profundidad ${depth} · ${player.onGround ? 'en suelo' : 'en el aire'}`,
+        `cursor (${editor.hoverX}, ${editor.hoverY}) = ${BLOCK_INFO[under].name} · enemigos ${enemies.enemies.length}`,
+        `A/D mover · Espacio/W saltar · clic izq. minar/atacar · clic der. construir`,
+        `1-0 slot · Esc pausa · M música · L luz ${lighting ? 'ON' : 'OFF'} · F cámara libre ${freeCam ? '(ACTIVA)' : ''} · R reaparecer · F3 depuración`,
+      ];
+
+      if (debugOn) {
+        const ps = chunkRenderer.poolStats;
+        const active = chunkRenderer.activeTextures;
+        const mem = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
+        lines.push(
+          '── DEPURACIÓN ──',
+          `fotograma más largo (0,25 s): ${frameMax.toFixed(1)} ms`,
+          `chunks: cargados ${world.loadedCount} · visibles ${chunkRenderer.visibleCount} · pendientes ${world.pendingCount}`,
+          pool
+            ? `workers: ${pool.size} · en cola ${pool.queued} · en curso ${pool.inFlight} · gen. media ${pool.avgMs.toFixed(2)} ms · generados ${pool.completed}`
+            : 'workers: desactivados (generación en el hilo principal)',
+          `texturas de chunk: ${active} en uso (≈ ${active} MB) · pool: creadas ${ps.created} · reutilizadas ${ps.reused} · inactivas ${ps.idle} · destruidas ${ps.destroyed}`,
+          `partículas ${particles.activeCount} · música ${audio.musicOn ? 'sí' : 'no'} · efectos ${audio.sfxOn ? 'sí' : 'no'}`,
+          mem ? `memoria JS: ${(mem.usedJSHeapSize / 1048576).toFixed(0)} MB` : 'memoria JS: no disponible en este navegador',
+        );
+      }
+      frameMax = 0;
+      setHud(lines.join('\n'));
     }
   });
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  loadingScreen?.fail(err instanceof Error ? err.message : String(err));
+});

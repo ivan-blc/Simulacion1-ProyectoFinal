@@ -2,14 +2,16 @@ import { Container, RenderTexture, Sprite } from 'pixi.js';
 import type { Application, Texture } from 'pixi.js';
 import { BLOCK_SIZE, BlockId, CHUNK_SIZE } from '../core/constants';
 import { chunkKey } from '../core/coords';
+import { ObjectPool } from '../core/ObjectPool';
 import type { Chunk } from '../world/Chunk';
 
 const CHUNK_PX = CHUNK_SIZE * BLOCK_SIZE;
+const MAX_IDLE_TEXTURES = 16;
 
 interface ChunkView {
   chunk: Chunk;
   sprite: Sprite;
-  rt: RenderTexture | null; // se crea en el primer render del chunk
+  rt: RenderTexture | null; // se pide al pool en el primer render del chunk
 }
 
 export interface ChunkRendererOptions {
@@ -32,6 +34,11 @@ export class ChunkRenderer {
   private readonly scratch = new Container(); // nunca se añade al stage
   private readonly cells: Sprite[] = [];
   private readonly opts: ChunkRendererOptions;
+  private readonly rtPool = new ObjectPool<RenderTexture>(
+    () => RenderTexture.create({ width: CHUNK_PX, height: CHUNK_PX, scaleMode: 'nearest' }),
+    (rt) => rt.destroy(true), // true = destruye también el recurso de GPU
+    MAX_IDLE_TEXTURES,
+  );
 
   constructor(opts: ChunkRendererOptions) {
     this.opts = opts;
@@ -47,6 +54,22 @@ export class ChunkRenderer {
     return this.views.size;
   }
 
+  /** Chunks que ahora mismo tienen una textura asignada (≈ 1 MB de GPU cada una). */
+  get activeTextures(): number {
+    let n = 0;
+    for (const v of this.views.values()) if (v.rt) n++;
+    return n;
+  }
+
+  get poolStats(): { created: number; reused: number; destroyed: number; idle: number } {
+    return {
+      created: this.rtPool.created,
+      reused: this.rtPool.reused,
+      destroyed: this.rtPool.destroyed,
+      idle: this.rtPool.idleCount,
+    };
+  }
+
   /** Enlazar con world.onChunkLoaded. */
   addChunk(chunk: Chunk): void {
     const sprite = new Sprite();
@@ -56,14 +79,14 @@ export class ChunkRenderer {
     this.views.set(chunkKey(chunk.cx, chunk.cy), { chunk, sprite, rt: null });
   }
 
-  /** Enlazar con world.onChunkUnloaded. Libera la memoria de la GPU. */
+  /** Enlazar con world.onChunkUnloaded. La textura vuelve al pool para reutilizarse. */
   removeChunk(chunk: Chunk): void {
     const key = chunkKey(chunk.cx, chunk.cy);
     const view = this.views.get(key);
     if (!view) return;
     this.container.removeChild(view.sprite);
-    view.sprite.destroy();
-    view.rt?.destroy(true); // true = destruye también el recurso de GPU
+    view.sprite.destroy(); // por defecto NO destruye la textura
+    if (view.rt) this.rtPool.release(view.rt);
     this.views.delete(key);
   }
 
@@ -109,11 +132,7 @@ export class ChunkRenderer {
     }
 
     if (!view.rt) {
-      view.rt = RenderTexture.create({
-        width: CHUNK_PX,
-        height: CHUNK_PX,
-        scaleMode: 'nearest',
-      });
+      view.rt = this.rtPool.acquire();
       view.sprite.texture = view.rt;
     }
 

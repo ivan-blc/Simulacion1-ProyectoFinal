@@ -23,10 +23,10 @@ export class BlockEditor {
   canEdit: (bx: number, by: number, placing: boolean) => boolean = () => true;
   /** Bloque que se colocaría ahora (null = nada que colocar). */
   getPlaceBlock: () => BlockId | null = () => BlockId.DIRT;
-  /** Se llama tras minar con éxito. */
-  onMine: (id: BlockId) => void = () => {};
+  /** Se llama tras minar con éxito (con la posición del bloque). */
+  onMine: (id: BlockId, bx: number, by: number) => void = () => {};
   /** Se llama tras colocar con éxito. */
-  onPlace: () => void = () => {};
+  onPlace: (bx: number, by: number) => void = () => {};
   /** Se llama antes de editar con el punto del cursor en px del mundo. Si devuelve true, no se edita. */
   tryInteract: (wx: number, wy: number, placing: boolean) => boolean = () => false;
 
@@ -126,10 +126,10 @@ export class BlockEditor {
       const item = this.getPlaceBlock();
       if (item === null) return;
       if (this.requireSupport && !this.hasSupport(bx, by)) return;
-      if (this.world.setBlock(bx, by, item)) this.onPlace();
+      if (this.world.setBlock(bx, by, item)) this.onPlace(bx, by);
     } else {
       if (current === BlockId.AIR) return;
-      if (this.world.setBlock(bx, by, BlockId.AIR)) this.onMine(current);
+      if (this.world.setBlock(bx, by, BlockId.AIR)) this.onMine(current, bx, by);
     }
   }
 

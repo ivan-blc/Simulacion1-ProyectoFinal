@@ -25,3 +25,9 @@ export const BLOCK_INFO: Record<number, BlockInfo> = {
 export function dropFor(id: number): BlockId | null {
   return BLOCK_INFO[id]?.drop ?? null;
 }
+
+/** '#rrggbb' -> 0xrrggbb (para tintes de Pixi). Cualquier otro formato devuelve blanco. */
+export function colorToNumber(css: string): number {
+  const m = /^#([0-9a-f]{6})$/i.exec(css);
+  return m ? parseInt(m[1], 16) : 0xffffff;
+}

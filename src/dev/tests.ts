@@ -9,7 +9,7 @@ import { GEN, ORES } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
 import { Player } from '../player/Player';
-import { colorToNumber, dropFor } from '../core/blockInfo';
+import { colorToNumber, dropFor, isSolidBlock } from '../core/blockInfo';
 import { Enemy, SLIME } from '../entities/Enemy';
 import { EnemyManager } from '../entities/EnemyManager';
 import { HOTBAR_SIZE, Inventory, MAX_STACK } from '../items/Inventory';
@@ -17,6 +17,9 @@ import { ObjectPool } from '../core/ObjectPool';
 import { seedFromText } from '../core/random';
 import type { ChunkProvider } from '../world/WorldManager';
 import type { InputState } from '../player/Player';
+import { TORCH_RECIPE, craftTorches } from '../items/crafting';
+import { AMBIENT, LightField, ambientAtDepth } from '../lighting/LightField';
+import { torchHasSupport } from '../world/torchRules';
 import {
   CELLS,
   LAYER_COUNT,
@@ -647,4 +650,149 @@ export function runPhase8Tests() {
     w.setBlock(5, 70, BlockId.AIR);
     check('onBlockChanged no avisa si el bloque no cambió', calls.length === 1);
   }
+}
+
+export function runPhase9Tests() {
+  // Bloques
+  check(
+    'antorcha: no es sólida; tierra y piedra sí; aire no',
+    !isSolidBlock(BlockId.TORCH) && isSolidBlock(BlockId.DIRT) && isSolidBlock(BlockId.STONE) && !isSolidBlock(BlockId.AIR),
+  );
+  check('minar una antorcha suelta una antorcha', dropFor(BlockId.TORCH) === BlockId.TORCH);
+
+  // Física: se atraviesa
+  {
+    const w = flatWorld();
+    w.setBlock(10, 63, BlockId.TORCH);
+    const p = landedPlayer(w);
+    run(p, 3, RIGHT);
+    check('el jugador atraviesa una antorcha', p.x > 12 * BLOCK_SIZE && p.onGround);
+  }
+
+  // Apoyo
+  {
+    const w = flatWorld();
+    const get = (x: number, y: number) => w.getBlock(x, y);
+    check('apoyo: sobre el suelo sí', torchHasSupport(get, 5, 63));
+    check('apoyo: en el aire no', !torchHasSupport(get, 5, 55));
+    w.setBlock(6, 55, BlockId.STONE);
+    check('apoyo: junto a una pared sí', torchHasSupport(get, 5, 55));
+    w.setBlock(20, 56, BlockId.TORCH);
+    check('apoyo: otra antorcha no sirve de apoyo', !torchHasSupport(get, 20, 55));
+  }
+
+  // Inventario y fabricación
+  {
+    const inv = new Inventory();
+    inv.add(BlockId.COAL, 3);
+    check(
+      'fabricar: 1 carbón da 4 antorchas',
+      craftTorches(inv) === 'ok' && inv.count(BlockId.COAL) === 2 && inv.count(BlockId.TORCH) === TORCH_RECIPE.torches,
+    );
+    check('fabricar: sin carbón no hace nada', craftTorches(new Inventory()) === 'no-coal');
+
+    const full = new Inventory();
+    full.add(BlockId.COAL, 1);
+    full.add(BlockId.DIRT, MAX_STACK * (HOTBAR_SIZE - 1));
+    check('fabricar: con el inventario lleno no gasta el carbón', craftTorches(full) === 'full' && full.count(BlockId.COAL) === 1);
+
+    const r = new Inventory();
+    r.add(BlockId.DIRT, 5);
+    check(
+      'Inventory.remove quita unidades y rechaza si no hay suficientes',
+      r.remove(BlockId.DIRT, 3) && r.count(BlockId.DIRT) === 2 && !r.remove(BlockId.DIRT, 9) && r.count(BlockId.DIRT) === 2,
+    );
+  }
+
+  // Campo de luz: rejilla x 0..23, y 45..62 (aire sobre el suelo plano en by = 64)
+  const setup = (w: WorldManager) => {
+    const f = new LightField(12);
+    f.begin(0, 45, 24, 18);
+    f.scan((cx, cy) => w.getChunk(cx, cy));
+    return f;
+  };
+
+  // Campo abierto
+  const wOpen = flatWorld();
+  {
+    const f = setup(wOpen);
+    f.addLight(10.5, 55.5, 8, 1);
+    const center = f.brightnessAt(10, 55);
+    const near = f.brightnessAt(12, 55);
+    const far = f.brightnessAt(16, 55);
+    check(
+      `luz abierta: máxima en la fuente (${center.toFixed(2)}), decrece con la distancia y se anula fuera del radio`,
+      center > 0.99 && near > far && far > 0 && f.brightnessAt(19, 55) === 0,
+    );
+  }
+
+  // Un muro bloquea la luz
+  {
+    const w = flatWorld();
+    for (let by = 45; by < 64; by++) w.setBlock(14, by, BlockId.STONE);
+    const f = setup(w);
+    f.addLight(10.5, 55.5, 8, 1);
+    check(
+      'un muro bloquea la luz: se ilumina su cara, no lo que hay detrás',
+      f.brightnessAt(13, 55) > 0.3 && f.brightnessAt(14, 55) > 0 && f.brightnessAt(15, 55) === 0 && f.brightnessAt(16, 56) === 0,
+    );
+  }
+
+  // Un enemigo proyecta una sombra parcial
+  {
+    const f1 = setup(wOpen);
+    f1.addLight(10.5, 55.5, 8, 1);
+    const free = f1.brightnessAt(14, 55);
+
+    const f2 = setup(wOpen);
+    f2.stampRect(12.1, 55.1, 12.9, 55.9, 0.6); // ocupa solo la celda (12, 55)
+    f2.addLight(10.5, 55.5, 8, 1);
+    const shadow = f2.brightnessAt(14, 55);
+    check(
+      'un enemigo proyecta una sombra parcial (deja pasar el 40 %)',
+      Math.abs(shadow - free * 0.4) < 0.01 && shadow > 0 && shadow < free,
+    );
+  }
+
+  // Varias luces
+  {
+    const f1 = setup(wOpen);
+    f1.addLight(8.5, 55.5, 8, 0.8);
+    const one = f1.brightnessAt(11, 55);
+    const f2 = setup(wOpen);
+    f2.addLight(8.5, 55.5, 8, 0.8);
+    f2.addLight(13.5, 55.5, 8, 0.8);
+    const both = f2.brightnessAt(11, 55);
+    check('dos luces suman sin pasar de 1', both > one && both <= 1);
+  }
+
+  // Antorchas como fuentes
+  {
+    const w = flatWorld();
+    w.setBlock(10, 55, BlockId.TORCH);
+    const f = setup(w);
+    f.addBlockLights(0);
+    check(
+      'scan encuentra las antorchas y addBlockLights las ilumina',
+      f.lightsCast === 1 && f.brightnessAt(10, 55) > 0.9 && f.brightnessAt(10, 55) <= 1,
+    );
+  }
+
+  // Chunks sin cargar
+  {
+    const f = new LightField(12);
+    f.begin(0, 45, 24, 18);
+    f.scan(() => undefined);
+    f.addLight(10.5, 55.5, 8, 1);
+    check('una zona sin cargar bloquea la luz', f.brightnessAt(11, 55) > 0 && f.brightnessAt(12, 55) === 0);
+  }
+
+  // Oscuridad ambiental
+  check(
+    'oscuridad ambiental: nula en superficie, creciente con la profundidad y acotada',
+    ambientAtDepth(-5) === 0 &&
+      ambientAtDepth(AMBIENT.START) === 0 &&
+      ambientAtDepth(20) > 0 &&
+      ambientAtDepth(200) === AMBIENT.MAX,
+  );
 }

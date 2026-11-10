@@ -1,6 +1,6 @@
 import { Texture } from 'pixi.js';
 import { BLOCK_INFO, colorToNumber } from '../core/blockInfo';
-import { BLOCK_SIZE, BlockId } from '../core/constants';
+import { BLOCK_SIZE } from '../core/constants';
 import { mulberry32 } from '../core/random';
 import { TILE_PX } from './smoothing';
 
@@ -45,7 +45,7 @@ function makeTile(id: number): Texture {
 /** Una textura repetible por id de bloque (el aire no se dibuja). */
 export function createTileTextures(): Texture[] {
   const count = Object.keys(BLOCK_INFO).length;
-  return Array.from({ length: count }, (_, id) => (id === BlockId.AIR ? Texture.EMPTY : makeTile(id)));
+  return Array.from({ length: count }, (_, id) => (BLOCK_INFO[id].solid ? makeTile(id) : Texture.EMPTY));
 }
 
 export function createBackgroundTextures(): { sky: Texture; cave: Texture } {
@@ -61,4 +61,23 @@ export function createBackgroundTextures(): { sky: Texture; cave: Texture } {
     return tex;
   };
   return { sky: make('#6ec0ff'), cave: make('#1c1622') };
+}
+
+/** Sprite de la antorcha (16x16): palo marrón y llama de tres tonos. */
+export function createTorchTexture(): Texture {
+  const canvas = document.createElement('canvas');
+  canvas.width = BLOCK_SIZE;
+  canvas.height = BLOCK_SIZE;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = '#6b4423';
+  ctx.fillRect(7, 7, 2, 9); // palo
+  ctx.fillStyle = '#ff7a1a';
+  ctx.fillRect(6, 3, 4, 5); // llama exterior
+  ctx.fillStyle = '#ffd24a';
+  ctx.fillRect(7, 4, 2, 3); // núcleo
+  ctx.fillStyle = '#fff3b0';
+  ctx.fillRect(7, 5, 2, 1); // punto más caliente
+  const tex = Texture.from(canvas);
+  tex.source.scaleMode = 'nearest';
+  return tex;
 }

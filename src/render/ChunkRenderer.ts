@@ -1,6 +1,6 @@
 import { Container, Mesh, MeshGeometry, RenderTexture, Sprite } from 'pixi.js';
 import type { Application, Texture } from 'pixi.js';
-import { BLOCK_SIZE, CHUNK_SIZE } from '../core/constants';
+import { BLOCK_SIZE, BlockId, CHUNK_SIZE } from '../core/constants';
 import { blockToChunkCoord, blockToLocalCoord, chunkKey } from '../core/coords';
 import { ObjectPool } from '../core/ObjectPool';
 import type { Chunk } from '../world/Chunk';
@@ -30,6 +30,8 @@ export interface ChunkRendererOptions {
   tileTextures: Texture[];
   sky: Texture;
   cave: Texture;
+  /** Textura de la antorcha (16x16). */
+  torchTexture: Texture;
   /** Altura de la superficie por columna: decide si un hueco es cielo o cueva. */
   surfaceHeight: (bx: number) => number;
   /** Lectura global de bloques (para el margen de 1 bloque con los chunks vecinos). */
@@ -52,6 +54,7 @@ export class ChunkRenderer {
   private readonly layers: LayerBuffers[] = [];
   private readonly geometries: MeshGeometry[] = [];
   private readonly meshes: Mesh[] = [];
+  private readonly torchSprites: Sprite[] = [];
 
   // Buffers de trabajo reutilizados en cada reconstrucción
   private readonly samples = new Uint8Array(SAMPLE_N * SAMPLE_N);
@@ -184,7 +187,7 @@ export class ChunkRenderer {
 
   private build(view: ChunkView): void {
     const { chunk } = view;
-    const { sky, cave, surfaceHeight, getBlock, renderer } = this.opts;
+    const { sky, cave, surfaceHeight, getBlock, renderer, torchTexture } = this.opts;
     const N = SAMPLE_N;
     const s = this.samples;
     const x0 = chunk.cx * CHUNK_SIZE;
@@ -224,6 +227,22 @@ export class ChunkRenderer {
       g.uvs = lb.uvs;
       g.indices = lb.indices;
     }
+
+    // 3b) Antorchas: sprites reutilizados, dibujados encima del terreno dentro de la textura del chunk
+    let torches = 0;
+    for (let i = 0; i < chunk.blocks.length; i++) {
+      if (chunk.blocks[i] !== BlockId.TORCH) continue;
+      let sprite = this.torchSprites[torches];
+      if (!sprite) {
+        sprite = new Sprite(torchTexture);
+        this.scratch.addChild(sprite); // se añade tras las mallas: se dibuja encima
+        this.torchSprites.push(sprite);
+      }
+      sprite.position.set((i % CHUNK_SIZE) * BLOCK_SIZE, Math.floor(i / CHUNK_SIZE) * BLOCK_SIZE);
+      sprite.visible = true;
+      torches++;
+    }
+    for (let k = torches; k < this.torchSprites.length; k++) this.torchSprites[k].visible = false;
 
     // 4) Dibujar en la textura del chunk (cada render hace clear: reutilizar es seguro)
     if (!view.rt) {

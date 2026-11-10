@@ -15,9 +15,10 @@ const COLORS: Record<number, RGB> = {
   [BlockId.DIRT]: [139, 90, 43],
   [BlockId.STONE]: [122, 122, 122],
   [BlockId.GRASS]: [76, 175, 80],
-    [BlockId.COAL]: [43, 43, 43],
+  [BlockId.COAL]: [43, 43, 43],
   [BlockId.IRON]: [217, 164, 124],
-  [BlockId.GOLD]: [242, 201, 76]
+  [BlockId.GOLD]: [242, 201, 76],
+  [BlockId.TORCH]: [255, 176, 46]
 };
 
 function makeWorld(gen: WorldGenerator): WorldManager {

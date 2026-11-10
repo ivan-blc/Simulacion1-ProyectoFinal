@@ -1,4 +1,5 @@
-import { BLOCK_SIZE, BlockId } from '../core/constants';
+import { isSolidBlock } from '../core/blockInfo';
+import { BLOCK_SIZE } from '../core/constants';
 import { blockToChunkCoord, worldToBlockCoord } from '../core/coords';
 import type { Player } from '../player/Player';
 import type { WorldManager } from '../world/WorldManager';
@@ -97,9 +98,9 @@ export class EnemyManager {
 
     for (let by = pby - SPAWN_SCAN; by <= pby + SPAWN_SCAN; by++) {
       if (!this.loaded(bx, by) || !this.loaded(bx, by + 1)) continue;
-      if (this.world.getBlock(bx, by) !== BlockId.AIR) continue;
-      if (this.world.getBlock(bx, by - 1) !== BlockId.AIR) continue;
-      if (this.world.getBlock(bx, by + 1) === BlockId.AIR) continue;
+      if (isSolidBlock(this.world.getBlock(bx, by))) continue;
+      if (isSolidBlock(this.world.getBlock(bx, by - 1))) continue;
+      if (!isSolidBlock(this.world.getBlock(bx, by + 1))) continue;
 
       const e = new Enemy(
         this.world,

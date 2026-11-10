@@ -1,4 +1,5 @@
 import { BLOCK_SIZE, BlockId, CHUNK_SIZE } from '../core/constants';
+import { isSolidBlock } from '../core/blockInfo';
 
 /** Lado de la rejilla de muestras: el chunk (32) + 1 bloque de margen por lado. */
 export const SAMPLE_N = CHUNK_SIZE + 2;
@@ -168,7 +169,7 @@ export function cellSkyMask(samples: Uint8Array, heights: ArrayLike<number>, fir
       for (let k = 0; k < 4; k++) {
         const si = ci + (k & 1);
         const sj = cj + (k >> 1);
-        if (samples[sj * SAMPLE_N + si] === BlockId.AIR && firstBy + sj < heights[si]) {
+        if (!isSolidBlock(samples[sj * SAMPLE_N + si]) && firstBy + sj < heights[si]) {
           sky = 1;
           break;
         }

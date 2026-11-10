@@ -1,7 +1,7 @@
 import { Application, Container, Graphics } from 'pixi.js';
 import { AudioManager } from './audio/AudioManager';
-import { BLOCK_INFO, colorToNumber, dropFor } from './core/blockInfo';
-import { BLOCK_SIZE, CHUNK_SIZE } from './core/constants';
+import { BLOCK_INFO, colorToNumber, dropFor, isSolidBlock } from './core/blockInfo';
+import { BLOCK_SIZE, BlockId, CHUNK_SIZE } from './core/constants';
 import { blockToChunkCoord, worldToBlockCoord } from './core/coords';
 import { seedFromText } from './core/random';
 import { showDebugMap } from './dev/debugMap';
@@ -13,32 +13,42 @@ import {
   runPhase5Tests,
   runPhase6Tests,
   runPhase7Tests,
+  runPhase8Tests,
+  runPhase9Tests,
   verifyWorkerChunk,
 } from './dev/tests';
 import { EnemyManager } from './entities/EnemyManager';
 import { Inventory } from './items/Inventory';
+import { TORCH_RECIPE, craftTorches } from './items/crafting';
+import { LightField } from './lighting/LightField';
 import { BlockEditor } from './player/BlockEditor';
 import { Player } from './player/Player';
 import type { InputState } from './player/Player';
 import { Camera } from './render/Camera';
 import { ChunkRenderer } from './render/ChunkRenderer';
-import { Darkness } from './render/Darkness';
 import { EnemyRenderer } from './render/EnemyRenderer';
+import { LightRenderer } from './render/LightRenderer';
 import { Particles } from './render/Particles';
-import { createBackgroundTextures, createTileTextures } from './render/atlas';
+import { createBackgroundTextures, createTileTextures, createTorchTexture } from './render/atlas';
 import { GameUi } from './ui/GameUi';
 import { LoadingScreen, PauseMenu, showTitleScreen } from './ui/Menu';
 import { ChunkStore } from './world/ChunkStore';
 import { ChunkWorkerPool } from './world/ChunkWorkerPool';
 import { WorldGenerator } from './world/WorldGenerator';
 import { WorldManager } from './world/WorldManager';
+import { torchHasSupport } from './world/torchRules';
 
 const CHUNK_PX = CHUNK_SIZE * BLOCK_SIZE;
 const ATTACK_DAMAGE = 10;
 const ATTACK_COOLDOWN = 0.35; // s entre golpes
-const LIGHT_RADIUS_BLOCKS = 9;
 const PRELOAD_RADIUS = 3; // chunks que se generan antes de empezar (7x7 = 49)
 const LAST_SEED_KEY = 'terraria-pixi-last-seed';
+
+// Iluminación
+const PLAYER_LIGHT_RADIUS = 10; // bloques
+const MAX_LIGHT_RADIUS = 12; // tope del campo de luz (la antorcha parpadea hasta ~8,6)
+const ENEMY_LIGHT_OPACITY = 0.6; // fracción de luz que absorbe un enemigo
+const STARTING_TORCHES = 20;
 
 const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -62,12 +72,16 @@ function writeLastSeed(text: string): void {
 let loadingScreen: LoadingScreen | null = null;
 
 async function main() {
-  runPhase1Tests();
-  runPhase2Tests();
-  runPhase4Tests();
-  runPhase5Tests();
-  runPhase6Tests();
-  runPhase7Tests();
+  if (import.meta.env.DEV) {
+    runPhase1Tests();
+    runPhase2Tests();
+    runPhase4Tests();
+    runPhase5Tests();
+    runPhase6Tests();
+    runPhase7Tests();
+    runPhase8Tests();
+    runPhase9Tests();
+  }
 
   // ?debug = mapa 2D · ?autostart = saltar el menú · ?seed=123 · ?reset = borrar guardado
   // ?noworker = generar en el hilo principal (para comparar rendimiento)
@@ -116,6 +130,8 @@ async function main() {
 
   const gen = new WorldGenerator(seed);
   const world = new WorldManager((chunk) => gen.generateChunk(chunk));
+  const getBlockFn = (bx: number, by: number): number => world.getBlock(bx, by);
+  const getChunkFn = (cx: number, cy: number) => world.getChunk(cx, cy);
 
   // Persistencia del mundo: se cargan las ediciones ANTES de crear el primer chunk
   loading.setProgress(0.08, 'Abriendo el guardado…');
@@ -131,10 +147,13 @@ async function main() {
 
   // Inventario (se guarda en localStorage, aparte del mundo)
   const invKey = `terraria-pixi-inv-${seed}`;
+  const giftKey = `terraria-pixi-torches-${seed}`;
   const inventory = new Inventory();
   try {
-    if (reset) localStorage.removeItem(invKey);
-    else {
+    if (reset) {
+      localStorage.removeItem(invKey);
+      localStorage.removeItem(giftKey);
+    } else {
       const raw = localStorage.getItem(invKey);
       if (raw) inventory.restore(raw);
     }
@@ -158,6 +177,17 @@ async function main() {
     ui.render();
     invDirty = true;
   };
+
+  // Regalo inicial de antorchas: una sola vez por mundo (también en mundos que ya tenías)
+  try {
+    if (!localStorage.getItem(giftKey)) {
+      inventory.add(BlockId.TORCH, STARTING_TORCHES);
+      localStorage.setItem(giftKey, '1');
+      ui.showMessage(`Recibiste ${STARTING_TORCHES} antorchas: selecciónalas y colócalas con el clic derecho`);
+    }
+  } catch {
+    /* sin localStorage no hay regalo */
+  }
 
   const persist = store;
   let saving = false;
@@ -197,8 +227,9 @@ async function main() {
     tileTextures: createTileTextures(),
     sky: bg.sky,
     cave: bg.cave,
+    torchTexture: createTorchTexture(),
     surfaceHeight: (bx) => gen.surfaceHeight(bx),
-    getBlock: (bx, by) => world.getBlock(bx, by),
+    getBlock: getBlockFn,
   });
   worldContainer.addChild(chunkRenderer.container);
 
@@ -216,7 +247,7 @@ async function main() {
         seed: gen.seed,
         size: Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 4) - 1)),
         onResult: (cx, cy, blocks, ms) => {
-          if (verified < 3) {
+          if (import.meta.env.DEV && verified < 3) {
             verified++;
             verifyWorkerChunk(gen, cx, cy, blocks, ms);
           }
@@ -253,6 +284,14 @@ async function main() {
   worldContainer.addChild(playerGfx);
   worldContainer.addChild(particles.container);
 
+  // Iluminación: la oscuridad va encima de entidades y partículas, pero debajo del cursor
+  const lightField = new LightField(MAX_LIGHT_RADIUS);
+  const lightRenderer = new LightRenderer();
+  worldContainer.addChild(lightRenderer.sprite);
+  const surfCols: number[] = [];
+  let lightTime = 0;
+  let lightMs = 0;
+
   // Edición con el ratón
   let freeCam = false;
   let lighting = true;
@@ -264,16 +303,36 @@ async function main() {
 
   editor.canEdit = (bx, by, placing) => {
     if (!freeCam && !player.canReach(bx, by)) return false;
-    if (placing) return !player.overlapsBlock(bx, by);
+    if (placing) {
+      const item = inventory.selectedItem();
+      if (item === null) return false;
+      if (isSolidBlock(item)) return !player.overlapsBlock(bx, by);
+      return torchHasSupport(getBlockFn, bx, by); // los ítems no sólidos (antorchas) necesitan apoyo
+    }
     const drop = dropFor(world.getBlock(bx, by));
     return drop === null || inventory.canAdd(drop); // inventario lleno: no se mina
   };
   editor.getPlaceBlock = () => inventory.selectedItem();
+
+  /** Tras minar un bloque, las antorchas que se apoyaban en él se sueltan y vuelven al inventario. */
+  function dropUnsupportedTorches(bx: number, by: number): void {
+    const around: Array<[number, number]> = [[bx - 1, by], [bx + 1, by], [bx, by - 1]];
+    for (const [x, y] of around) {
+      if (world.getBlock(x, y) !== BlockId.TORCH) continue;
+      if (torchHasSupport(getBlockFn, x, y)) continue;
+      if (!inventory.canAdd(BlockId.TORCH)) continue; // sin sitio: la antorcha queda flotando
+      world.setBlock(x, y, BlockId.AIR);
+      inventory.add(BlockId.TORCH);
+      particles.burst((x + 0.5) * BLOCK_SIZE, (y + 0.5) * BLOCK_SIZE, colorToNumber(BLOCK_INFO[BlockId.TORCH].color), 5, 60);
+    }
+  }
+
   editor.onMine = (id, bx, by) => {
     const drop = dropFor(id);
     if (drop !== null) inventory.add(drop);
     particles.burst((bx + 0.5) * BLOCK_SIZE, (by + 0.5) * BLOCK_SIZE, colorToNumber(BLOCK_INFO[id].color));
     audio.play('mine');
+    dropUnsupportedTorches(bx, by);
   };
   editor.onPlace = () => {
     inventory.consumeSelected();
@@ -341,11 +400,6 @@ async function main() {
   chunkRenderer.maxBuildsPerFrame = 4;
   spawnPlayer();
 
-  // Iluminación (capa de pantalla, encima del mundo)
-  const darkness = new Darkness();
-  app.stage.addChild(darkness.container);
-  let darkLevel = 0;
-
   // Entrada, pausa y menú
   const keys = new Set<string>();
   let paused = false;
@@ -396,6 +450,16 @@ async function main() {
     if (k === 'm') {
       const on = audio.setMusic(!audio.musicOn);
       ui.showMessage(on ? 'Música activada' : 'Música desactivada');
+    }
+    if (k === 'c') {
+      const result = craftTorches(inventory);
+      ui.showMessage(
+        result === 'ok'
+          ? `Fabricaste ${TORCH_RECIPE.torches} antorchas (−${TORCH_RECIPE.coal} de carbón)`
+          : result === 'no-coal'
+            ? `Necesitas ${TORCH_RECIPE.coal} de carbón para fabricar antorchas`
+            : 'Inventario lleno',
+      );
     }
     if (/^[0-9]$/.test(e.key)) inventory.select(e.key === '0' ? 9 : Number(e.key) - 1);
   });
@@ -474,31 +538,59 @@ async function main() {
     const b = camera.bounds(w, h);
     chunkRenderer.update(b.left, b.top, b.right, b.bottom);
 
-    // Oscuridad según la profundidad bajo la superficie de la columna del jugador
     const pbx = worldToBlockCoord(player.x + player.width / 2);
     const pby = worldToBlockCoord(player.y + player.height / 2);
     const depth = pby - gen.surfaceHeight(pbx);
-    const targetDark = lighting && !freeCam ? Math.min(1, Math.max(0, (depth - 6) / 30)) * 0.93 : 0;
-    darkLevel += (targetDark - darkLevel) * (1 - Math.exp(-3 * dt));
-    darkness.update(
-      w,
-      h,
-      worldContainer.x + (player.x + player.width / 2) * camera.zoom,
-      worldContainer.y + (player.y + player.height / 2) * camera.zoom,
-      LIGHT_RADIUS_BLOCKS * BLOCK_SIZE * camera.zoom,
-      darkLevel,
-    );
+
+    // Iluminación por ray casting: bloques y enemigos bloquean la luz del jugador y de las antorchas
+    if (lighting && !freeCam) {
+      const t0 = performance.now();
+      lightTime += dt;
+
+      // Tamaño fijo para una pantalla y un zoom dados (evita reservar memoria cada vez que se mueve la cámara)
+      const gx0 = Math.floor(b.left / BLOCK_SIZE) - 1;
+      const gy0 = Math.floor(b.top / BLOCK_SIZE) - 1;
+      const gw = Math.ceil((b.right - b.left) / BLOCK_SIZE) + 3;
+      const gh = Math.ceil((b.bottom - b.top) / BLOCK_SIZE) + 3;
+
+      lightField.begin(gx0, gy0, gw, gh);
+      lightField.scan(getChunkFn);
+      for (const e of enemies.enemies) {
+        lightField.stampRect(
+          e.x / BLOCK_SIZE,
+          e.y / BLOCK_SIZE,
+          (e.x + e.width) / BLOCK_SIZE,
+          (e.y + e.height) / BLOCK_SIZE,
+          ENEMY_LIGHT_OPACITY,
+        );
+      }
+      lightField.addLight(
+        (player.x + player.width / 2) / BLOCK_SIZE,
+        (player.y + player.height / 2) / BLOCK_SIZE,
+        PLAYER_LIGHT_RADIUS,
+        1,
+      );
+      lightField.addBlockLights(lightTime);
+
+      for (let i = 0; i < gw; i++) surfCols[i] = gen.surfaceHeight(gx0 + i);
+      lightRenderer.update(lightField, surfCols);
+      lightMs = performance.now() - t0;
+    } else {
+      lightRenderer.hide();
+      lightMs = 0;
+    }
 
     hudTimer += dt;
     if (hudTimer > 0.25) {
       hudTimer = 0;
       const under = world.getBlock(editor.hoverX, editor.hoverY);
+      const selected = inventory.selectedItem();
       const lines = [
         `FPS ${app.ticker.FPS.toFixed(0)} · chunks ${world.loadedCount} (visibles ${chunkRenderer.visibleCount}) · zoom ${camera.zoom}x`,
         `jugador (${pbx}, ${pby}) · profundidad ${depth} · ${player.onGround ? 'en suelo' : 'en el aire'}`,
         `cursor (${editor.hoverX}, ${editor.hoverY}) = ${BLOCK_INFO[under].name} · enemigos ${enemies.enemies.length}`,
-        `A/D mover · Espacio/W saltar · clic izq. minar/atacar · clic der. construir`,
-        `1-0 slot · Esc pausa · M música · L luz ${lighting ? 'ON' : 'OFF'} · F cámara libre ${freeCam ? '(ACTIVA)' : ''} · R reaparecer · F3 depuración`,
+        `A/D mover · Espacio/W saltar · clic izq. minar/atacar · clic der. construir/antorcha${selected === BlockId.TORCH ? ' (necesita apoyo)' : ''}`,
+        `1-0 slot · C fabricar antorchas · Esc pausa · M música · L luz ${lighting ? 'ON' : 'OFF'} · F cámara libre ${freeCam ? '(ACTIVA)' : ''} · R reaparecer · F3 depuración`,
       ];
 
       if (debugOn) {
@@ -508,6 +600,7 @@ async function main() {
         lines.push(
           '── DEPURACIÓN ──',
           `fotograma más largo (0,25 s): ${frameMax.toFixed(1)} ms`,
+          `luz: ${lightField.lightsCast} fuentes · ${lightField.raysCast} rayos · ${lightMs.toFixed(2)} ms · rejilla ${lightField.gw}x${lightField.gh}`,
           `chunks: cargados ${world.loadedCount} · visibles ${chunkRenderer.visibleCount} · pendientes ${world.pendingCount}`,
           pool
             ? `workers: ${pool.size} · en cola ${pool.queued} · en curso ${pool.inFlight} · gen. media ${pool.avgMs.toFixed(2)} ms · generados ${pool.completed}`

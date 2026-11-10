@@ -9,6 +9,8 @@ export const BlockId = {
   COAL: 4,
   IRON: 5,
   GOLD: 6,
+  TORCH: 7,
 } as const;
 
 export type BlockId = (typeof BlockId)[keyof typeof BlockId];
+

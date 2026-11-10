@@ -34,6 +34,29 @@ export class Inventory {
     return room >= amount;
   }
 
+  /** Total de unidades de un ítem en toda la barra. */
+  count(id: BlockId): number {
+    let n = 0;
+    for (const s of this.slots) if (s && s.id === id) n += s.count;
+    return n;
+  }
+
+  /** Quita unidades de un ítem repartidas por los slots. Si no hay suficientes, no quita nada y devuelve false. */
+  remove(id: BlockId, amount = 1): boolean {
+    if (this.count(id) < amount) return false;
+    let left = amount;
+    for (let i = this.slots.length - 1; i >= 0 && left > 0; i--) {
+      const s = this.slots[i];
+      if (!s || s.id !== id) continue;
+      const n = Math.min(s.count, left);
+      s.count -= n;
+      left -= n;
+      if (s.count <= 0) this.slots[i] = null;
+    }
+    this.onChange?.();
+    return true;
+  }
+
   /** Devuelve cuántas unidades NO cupieron (0 si cupo todo). */
   add(id: BlockId, amount = 1): number {
     let left = amount;

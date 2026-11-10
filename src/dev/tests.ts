@@ -9,7 +9,7 @@ import { GEN, ORES } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
 import { Player } from '../player/Player';
-import { colorToNumber, dropFor } from '../core/blockInfo';
+import { colorToNumber, dropFor, isSolidBlock } from '../core/blockInfo';
 import { Enemy, SLIME } from '../entities/Enemy';
 import { EnemyManager } from '../entities/EnemyManager';
 import { HOTBAR_SIZE, Inventory, MAX_STACK } from '../items/Inventory';
@@ -17,6 +17,19 @@ import { ObjectPool } from '../core/ObjectPool';
 import { seedFromText } from '../core/random';
 import type { ChunkProvider } from '../world/WorldManager';
 import type { InputState } from '../player/Player';
+import { TORCH_RECIPE, craftTorches } from '../items/crafting';
+import { AMBIENT, LightField, ambientAtDepth } from '../lighting/LightField';
+import { torchHasSupport } from '../world/torchRules';
+import {
+  CELLS,
+  LAYER_COUNT,
+  LayerBuffers,
+  SAMPLE_N,
+  buildSmoothLayers,
+  caseArea,
+  cellSkyMask,
+  layerArea,
+} from '../render/smoothing';
 
 
 function check(name: string, cond: boolean) {
@@ -571,5 +584,215 @@ export function runPhase7Tests() {
   check(
     'sin provider vuelve a generar de forma síncrona (fallback)',
     w2.loadedCount === 9 && w2.loadedInArea(5, 0, 1) === 9,
+  );
+}
+
+export function runPhase8Tests() {
+  const cellArea = BLOCK_SIZE * BLOCK_SIZE;
+  const N = SAMPLE_N;
+  const makeLayers = () => Array.from({ length: LAYER_COUNT }, () => new LayerBuffers(CELLS * CELLS));
+
+  // Tabla de casos
+  const expected = [0, 1 / 8, 1 / 8, 1 / 2, 1 / 8, 3 / 4, 1 / 2, 7 / 8, 1 / 8, 1 / 2, 3 / 4, 7 / 8, 1 / 2, 7 / 8, 7 / 8, 1];
+  check(
+    'marching squares: el área de cada uno de los 16 casos es la esperada',
+    expected.every((a, m) => Math.abs(caseArea(m) - a) < 1e-9),
+  );
+  check(
+    'marching squares: un caso y su complemento suman la celda entera (salvo las sillas 5 y 10)',
+    [1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14].every((m) => Math.abs(caseArea(m) + caseArea(15 - m) - 1) < 1e-9),
+  );
+
+  // Un bloque aislado se ve como un rombo de media celda de área
+  {
+    const ranks = new Uint8Array(N * N);
+    ranks[10 * N + 10] = 2; // un bloque de tierra (rango 2)
+    const layers = makeLayers();
+    buildSmoothLayers(ranks, layers);
+    check('bloque aislado: la capa 1 es un rombo de media celda', Math.abs(layerArea(layers[0]) - cellArea / 2) < 1e-6);
+    check('bloque aislado: la capa 2 (su material) es el mismo rombo', Math.abs(layerArea(layers[1]) - cellArea / 2) < 1e-6);
+    check('bloque aislado: no genera capas de rango superior', layers.slice(2).every((l) => l.indexCount === 0));
+  }
+
+  // Una superficie plana queda exactamente en el borde entre dos filas de bloques
+  {
+    const ranks = new Uint8Array(N * N);
+    for (let sj = 20; sj < N; sj++) for (let si = 0; si < N; si++) ranks[sj * N + si] = 1;
+    const layers = makeLayers();
+    buildSmoothLayers(ranks, layers);
+    const l = layers[0];
+    let minY = Infinity;
+    for (let v = 0; v < l.vertexCount; v++) minY = Math.min(minY, l.positions[v * 2 + 1]);
+    const expectedArea = CELLS * BLOCK_SIZE * (CELLS - 19.5) * BLOCK_SIZE;
+    check('superficie plana: el área sólida es la esperada', Math.abs(layerArea(l) - expectedArea) < 1e-6);
+    check('superficie plana: queda exactamente en el borde entre bloques', minY === 19 * BLOCK_SIZE);
+  }
+
+  // Fondo por celdas
+  {
+    const samples = new Uint8Array(N * N);
+    for (let sj = 20; sj < N; sj++) for (let si = 0; si < N; si++) samples[sj * N + si] = BlockId.STONE;
+    const heights = new Array<number>(N).fill(10);
+    const mask = cellSkyMask(samples, heights, 0);
+    check('fondo: el aire sobre la superficie es cielo', mask[5 * CELLS + 5] === 1);
+    check('fondo: el aire bajo la superficie es cueva', mask[15 * CELLS + 5] === 0);
+  }
+
+  // Hook de cambio de bloque (usado para marcar los chunks vecinos)
+  {
+    const w = new WorldManager();
+    const calls: string[] = [];
+    w.onBlockChanged = (bx, by) => {
+      calls.push(`${bx},${by}`);
+    };
+    w.setBlock(5, 70, BlockId.AIR); // en el mundo plano por defecto, by 70 es piedra
+    check('onBlockChanged avisa del cambio con sus coordenadas', calls.length === 1 && calls[0] === '5,70');
+    w.setBlock(5, 70, BlockId.AIR);
+    check('onBlockChanged no avisa si el bloque no cambió', calls.length === 1);
+  }
+}
+
+export function runPhase9Tests() {
+  // Bloques
+  check(
+    'antorcha: no es sólida; tierra y piedra sí; aire no',
+    !isSolidBlock(BlockId.TORCH) && isSolidBlock(BlockId.DIRT) && isSolidBlock(BlockId.STONE) && !isSolidBlock(BlockId.AIR),
+  );
+  check('minar una antorcha suelta una antorcha', dropFor(BlockId.TORCH) === BlockId.TORCH);
+
+  // Física: se atraviesa
+  {
+    const w = flatWorld();
+    w.setBlock(10, 63, BlockId.TORCH);
+    const p = landedPlayer(w);
+    run(p, 3, RIGHT);
+    check('el jugador atraviesa una antorcha', p.x > 12 * BLOCK_SIZE && p.onGround);
+  }
+
+  // Apoyo
+  {
+    const w = flatWorld();
+    const get = (x: number, y: number) => w.getBlock(x, y);
+    check('apoyo: sobre el suelo sí', torchHasSupport(get, 5, 63));
+    check('apoyo: en el aire no', !torchHasSupport(get, 5, 55));
+    w.setBlock(6, 55, BlockId.STONE);
+    check('apoyo: junto a una pared sí', torchHasSupport(get, 5, 55));
+    w.setBlock(20, 56, BlockId.TORCH);
+    check('apoyo: otra antorcha no sirve de apoyo', !torchHasSupport(get, 20, 55));
+  }
+
+  // Inventario y fabricación
+  {
+    const inv = new Inventory();
+    inv.add(BlockId.COAL, 3);
+    check(
+      'fabricar: 1 carbón da 4 antorchas',
+      craftTorches(inv) === 'ok' && inv.count(BlockId.COAL) === 2 && inv.count(BlockId.TORCH) === TORCH_RECIPE.torches,
+    );
+    check('fabricar: sin carbón no hace nada', craftTorches(new Inventory()) === 'no-coal');
+
+    const full = new Inventory();
+    full.add(BlockId.COAL, 1);
+    full.add(BlockId.DIRT, MAX_STACK * (HOTBAR_SIZE - 1));
+    check('fabricar: con el inventario lleno no gasta el carbón', craftTorches(full) === 'full' && full.count(BlockId.COAL) === 1);
+
+    const r = new Inventory();
+    r.add(BlockId.DIRT, 5);
+    check(
+      'Inventory.remove quita unidades y rechaza si no hay suficientes',
+      r.remove(BlockId.DIRT, 3) && r.count(BlockId.DIRT) === 2 && !r.remove(BlockId.DIRT, 9) && r.count(BlockId.DIRT) === 2,
+    );
+  }
+
+  // Campo de luz: rejilla x 0..23, y 45..62 (aire sobre el suelo plano en by = 64)
+  const setup = (w: WorldManager) => {
+    const f = new LightField(12);
+    f.begin(0, 45, 24, 18);
+    f.scan((cx, cy) => w.getChunk(cx, cy));
+    return f;
+  };
+
+  // Campo abierto
+  const wOpen = flatWorld();
+  {
+    const f = setup(wOpen);
+    f.addLight(10.5, 55.5, 8, 1);
+    const center = f.brightnessAt(10, 55);
+    const near = f.brightnessAt(12, 55);
+    const far = f.brightnessAt(16, 55);
+    check(
+      `luz abierta: máxima en la fuente (${center.toFixed(2)}), decrece con la distancia y se anula fuera del radio`,
+      center > 0.99 && near > far && far > 0 && f.brightnessAt(19, 55) === 0,
+    );
+  }
+
+  // Un muro bloquea la luz
+  {
+    const w = flatWorld();
+    for (let by = 45; by < 64; by++) w.setBlock(14, by, BlockId.STONE);
+    const f = setup(w);
+    f.addLight(10.5, 55.5, 8, 1);
+    check(
+      'un muro bloquea la luz: se ilumina su cara, no lo que hay detrás',
+      f.brightnessAt(13, 55) > 0.3 && f.brightnessAt(14, 55) > 0 && f.brightnessAt(15, 55) === 0 && f.brightnessAt(16, 56) === 0,
+    );
+  }
+
+  // Un enemigo proyecta una sombra parcial
+  {
+    const f1 = setup(wOpen);
+    f1.addLight(10.5, 55.5, 8, 1);
+    const free = f1.brightnessAt(14, 55);
+
+    const f2 = setup(wOpen);
+    f2.stampRect(12.1, 55.1, 12.9, 55.9, 0.6); // ocupa solo la celda (12, 55)
+    f2.addLight(10.5, 55.5, 8, 1);
+    const shadow = f2.brightnessAt(14, 55);
+    check(
+      'un enemigo proyecta una sombra parcial (deja pasar el 40 %)',
+      Math.abs(shadow - free * 0.4) < 0.01 && shadow > 0 && shadow < free,
+    );
+  }
+
+  // Varias luces
+  {
+    const f1 = setup(wOpen);
+    f1.addLight(8.5, 55.5, 8, 0.8);
+    const one = f1.brightnessAt(11, 55);
+    const f2 = setup(wOpen);
+    f2.addLight(8.5, 55.5, 8, 0.8);
+    f2.addLight(13.5, 55.5, 8, 0.8);
+    const both = f2.brightnessAt(11, 55);
+    check('dos luces suman sin pasar de 1', both > one && both <= 1);
+  }
+
+  // Antorchas como fuentes
+  {
+    const w = flatWorld();
+    w.setBlock(10, 55, BlockId.TORCH);
+    const f = setup(w);
+    f.addBlockLights(0);
+    check(
+      'scan encuentra las antorchas y addBlockLights las ilumina',
+      f.lightsCast === 1 && f.brightnessAt(10, 55) > 0.9 && f.brightnessAt(10, 55) <= 1,
+    );
+  }
+
+  // Chunks sin cargar
+  {
+    const f = new LightField(12);
+    f.begin(0, 45, 24, 18);
+    f.scan(() => undefined);
+    f.addLight(10.5, 55.5, 8, 1);
+    check('una zona sin cargar bloquea la luz', f.brightnessAt(11, 55) > 0 && f.brightnessAt(12, 55) === 0);
+  }
+
+  // Oscuridad ambiental
+  check(
+    'oscuridad ambiental: nula en superficie, creciente con la profundidad y acotada',
+    ambientAtDepth(-5) === 0 &&
+      ambientAtDepth(AMBIENT.START) === 0 &&
+      ambientAtDepth(20) > 0 &&
+      ambientAtDepth(200) === AMBIENT.MAX,
   );
 }

@@ -32,6 +32,8 @@ export class WorldManager {
   /** Hooks de render. */
   onChunkLoaded?: (chunk: Chunk) => void;
   onChunkUnloaded?: (chunk: Chunk) => void;
+  /** Se llama tras cambiar un bloque con setBlock (no al generar chunks). */
+  onBlockChanged?: (bx: number, by: number) => void;
 
   constructor(generator: ChunkGenerator = flatGenerator) {
     this.generator = generator;
@@ -140,6 +142,7 @@ export class WorldManager {
     }
     m.set(ly * CHUNK_SIZE + lx, id);
     this.modifiedKeys.add(key);
+    this.onBlockChanged?.(bx, by);
     return true;
   }
 

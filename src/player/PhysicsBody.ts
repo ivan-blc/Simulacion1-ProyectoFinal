@@ -1,7 +1,8 @@
-import { BLOCK_SIZE, BlockId } from '../core/constants';
+import { BLOCK_SIZE } from '../core/constants';
 import { blockToChunkCoord } from '../core/coords';
 import type { WorldManager } from '../world/WorldManager';
 import { PLAYER } from './playerParams';
+import { isSolidBlock } from '../core/blockInfo';
 
 const EPS = 0.001;
 
@@ -46,7 +47,7 @@ export class PhysicsBody {
   /** Un chunk sin cargar cuenta como sólido: nada cae al vacío. */
   protected isSolid(bx: number, by: number): boolean {
     if (!this.world.getChunk(blockToChunkCoord(bx), blockToChunkCoord(by))) return true;
-    return this.world.getBlock(bx, by) !== BlockId.AIR;
+    return isSolidBlock(this.world.getBlock(bx, by));
   }
 
   protected overlapsSolid(x: number, y: number): boolean {

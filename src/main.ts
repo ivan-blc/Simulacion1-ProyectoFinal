@@ -25,7 +25,7 @@ import { ChunkRenderer } from './render/ChunkRenderer';
 import { Darkness } from './render/Darkness';
 import { EnemyRenderer } from './render/EnemyRenderer';
 import { Particles } from './render/Particles';
-import { createBackgroundTextures, createBlockTextures } from './render/atlas';
+import { createBackgroundTextures, createTileTextures } from './render/atlas';
 import { GameUi } from './ui/GameUi';
 import { LoadingScreen, PauseMenu, showTitleScreen } from './ui/Menu';
 import { ChunkStore } from './world/ChunkStore';
@@ -194,15 +194,17 @@ async function main() {
   const bg = createBackgroundTextures();
   const chunkRenderer = new ChunkRenderer({
     renderer: app.renderer,
-    blockTextures: createBlockTextures(),
+    tileTextures: createTileTextures(),
     sky: bg.sky,
     cave: bg.cave,
     surfaceHeight: (bx) => gen.surfaceHeight(bx),
+    getBlock: (bx, by) => world.getBlock(bx, by),
   });
   worldContainer.addChild(chunkRenderer.container);
 
   world.onChunkLoaded = (chunk) => chunkRenderer.addChunk(chunk);
   world.onChunkUnloaded = (chunk) => chunkRenderer.removeChunk(chunk);
+  world.onBlockChanged = (bx, by) => chunkRenderer.onBlockChanged(bx, by);
 
   // Generación en Web Workers (con fallback a generar en el hilo principal)
   loading.setProgress(0.12, 'Iniciando los generadores de terreno…');

@@ -17,6 +17,16 @@ import { ObjectPool } from '../core/ObjectPool';
 import { seedFromText } from '../core/random';
 import type { ChunkProvider } from '../world/WorldManager';
 import type { InputState } from '../player/Player';
+import {
+  CELLS,
+  LAYER_COUNT,
+  LayerBuffers,
+  SAMPLE_N,
+  buildSmoothLayers,
+  caseArea,
+  cellSkyMask,
+  layerArea,
+} from '../render/smoothing';
 
 
 function check(name: string, cond: boolean) {
@@ -572,4 +582,69 @@ export function runPhase7Tests() {
     'sin provider vuelve a generar de forma síncrona (fallback)',
     w2.loadedCount === 9 && w2.loadedInArea(5, 0, 1) === 9,
   );
+}
+
+export function runPhase8Tests() {
+  const cellArea = BLOCK_SIZE * BLOCK_SIZE;
+  const N = SAMPLE_N;
+  const makeLayers = () => Array.from({ length: LAYER_COUNT }, () => new LayerBuffers(CELLS * CELLS));
+
+  // Tabla de casos
+  const expected = [0, 1 / 8, 1 / 8, 1 / 2, 1 / 8, 3 / 4, 1 / 2, 7 / 8, 1 / 8, 1 / 2, 3 / 4, 7 / 8, 1 / 2, 7 / 8, 7 / 8, 1];
+  check(
+    'marching squares: el área de cada uno de los 16 casos es la esperada',
+    expected.every((a, m) => Math.abs(caseArea(m) - a) < 1e-9),
+  );
+  check(
+    'marching squares: un caso y su complemento suman la celda entera (salvo las sillas 5 y 10)',
+    [1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14].every((m) => Math.abs(caseArea(m) + caseArea(15 - m) - 1) < 1e-9),
+  );
+
+  // Un bloque aislado se ve como un rombo de media celda de área
+  {
+    const ranks = new Uint8Array(N * N);
+    ranks[10 * N + 10] = 2; // un bloque de tierra (rango 2)
+    const layers = makeLayers();
+    buildSmoothLayers(ranks, layers);
+    check('bloque aislado: la capa 1 es un rombo de media celda', Math.abs(layerArea(layers[0]) - cellArea / 2) < 1e-6);
+    check('bloque aislado: la capa 2 (su material) es el mismo rombo', Math.abs(layerArea(layers[1]) - cellArea / 2) < 1e-6);
+    check('bloque aislado: no genera capas de rango superior', layers.slice(2).every((l) => l.indexCount === 0));
+  }
+
+  // Una superficie plana queda exactamente en el borde entre dos filas de bloques
+  {
+    const ranks = new Uint8Array(N * N);
+    for (let sj = 20; sj < N; sj++) for (let si = 0; si < N; si++) ranks[sj * N + si] = 1;
+    const layers = makeLayers();
+    buildSmoothLayers(ranks, layers);
+    const l = layers[0];
+    let minY = Infinity;
+    for (let v = 0; v < l.vertexCount; v++) minY = Math.min(minY, l.positions[v * 2 + 1]);
+    const expectedArea = CELLS * BLOCK_SIZE * (CELLS - 19.5) * BLOCK_SIZE;
+    check('superficie plana: el área sólida es la esperada', Math.abs(layerArea(l) - expectedArea) < 1e-6);
+    check('superficie plana: queda exactamente en el borde entre bloques', minY === 19 * BLOCK_SIZE);
+  }
+
+  // Fondo por celdas
+  {
+    const samples = new Uint8Array(N * N);
+    for (let sj = 20; sj < N; sj++) for (let si = 0; si < N; si++) samples[sj * N + si] = BlockId.STONE;
+    const heights = new Array<number>(N).fill(10);
+    const mask = cellSkyMask(samples, heights, 0);
+    check('fondo: el aire sobre la superficie es cielo', mask[5 * CELLS + 5] === 1);
+    check('fondo: el aire bajo la superficie es cueva', mask[15 * CELLS + 5] === 0);
+  }
+
+  // Hook de cambio de bloque (usado para marcar los chunks vecinos)
+  {
+    const w = new WorldManager();
+    const calls: string[] = [];
+    w.onBlockChanged = (bx, by) => {
+      calls.push(`${bx},${by}`);
+    };
+    w.setBlock(5, 70, BlockId.AIR); // en el mundo plano por defecto, by 70 es piedra
+    check('onBlockChanged avisa del cambio con sus coordenadas', calls.length === 1 && calls[0] === '5,70');
+    w.setBlock(5, 70, BlockId.AIR);
+    check('onBlockChanged no avisa si el bloque no cambió', calls.length === 1);
+  }
 }

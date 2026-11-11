@@ -5,7 +5,7 @@ import type { Chunk } from '../world/Chunk';
 /** Oscuridad ambiental: nula hasta START bloques bajo la superficie, máxima a partir de START + RAMP. */
 export const AMBIENT = { START: 6, RAMP: 30, MAX: 0.93 } as const;
 
-/** Por debajo de este brillo una fuente no aporta nada a la celda (ahorra rayos). */
+/** Por debajo de este brillo una fuente no aporta nada a la muestra (ahorra rayos). */
 const MIN_BRIGHTNESS = 0.01;
 
 const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -32,6 +32,8 @@ export class LightField {
   readonly maxRadius: number;
   /** Margen (en bloques) alrededor de la rejilla visible donde se leen opacidades y fuentes. */
   readonly margin: number;
+  /** Muestras de luz por bloque y por eje: 1 = una por bloque, 2 = cuatro, 3 = nueve. */
+  readonly scale: number;
 
   // Rejilla visible, en coordenadas de bloque
   gx0 = 0;
@@ -41,6 +43,9 @@ export class LightField {
   // Región ampliada con el margen
   ew = 0;
   eh = 0;
+  // Rejilla de muestras (gw * scale por gh * scale)
+  sw = 0;
+  sh = 0;
 
   /** Estadísticas de la última pasada. */
   lightsCast = 0;
@@ -51,12 +56,13 @@ export class LightField {
   /** Fuentes encontradas en los bloques: [bx, by, radio, intensidad] repetido. */
   private readonly emitters: number[] = [];
 
-  constructor(maxRadius: number) {
+  constructor(maxRadius: number, scale = 1) {
     this.maxRadius = maxRadius;
+    this.scale = Math.max(1, Math.round(scale));
     this.margin = Math.ceil(maxRadius) + 1;
   }
 
-  /** Fracción de luz que NO llega a cada celda de la rejilla (1 = a oscuras, 0 = totalmente iluminada). */
+  /** Fracción de luz que NO llega a cada muestra (1 = a oscuras, 0 = totalmente iluminada). Tamaño sw * sh. */
   get unlit(): Float32Array {
     return this.unlitBuf;
   }
@@ -68,8 +74,10 @@ export class LightField {
       this.gh = gh;
       this.ew = gw + 2 * this.margin;
       this.eh = gh + 2 * this.margin;
+      this.sw = gw * this.scale;
+      this.sh = gh * this.scale;
       this.opacity = new Float32Array(this.ew * this.eh);
-      this.unlitBuf = new Float32Array(gw * gh);
+      this.unlitBuf = new Float32Array(this.sw * this.sh);
     }
     this.gx0 = gx0;
     this.gy0 = gy0;
@@ -145,8 +153,8 @@ export class LightField {
   }
 
   /**
-   * Añade una fuente en (sx, sy), en bloques con decimales. Para cada celda de la rejilla dentro del
-   * radio traza un rayo hasta su centro y acumula la opacidad de lo que atraviesa.
+   * Añade una fuente en (sx, sy), en bloques con decimales. Para cada MUESTRA de la rejilla dentro
+   * del radio traza un rayo hasta su posición y acumula la opacidad de lo que atraviesa.
    */
   addLight(sx: number, sy: number, radius: number, intensity: number): void {
     const r = Math.min(radius, this.maxRadius);
@@ -160,16 +168,19 @@ export class LightField {
     if (scx < ex0 || scy < ey0 || scx >= ex0 + this.ew || scy >= ey0 + this.eh) return;
     this.lightsCast++;
 
-    const x0 = Math.max(this.gx0, Math.floor(sx - r));
-    const x1 = Math.min(this.gx0 + this.gw - 1, Math.floor(sx + r));
-    const y0 = Math.max(this.gy0, Math.floor(sy - r));
-    const y1 = Math.min(this.gy0 + this.gh - 1, Math.floor(sy + r));
+    const S = this.scale;
+    const i0 = Math.max(0, Math.floor((sx - r - this.gx0) * S));
+    const i1 = Math.min(this.sw - 1, Math.ceil((sx + r - this.gx0) * S));
+    const j0 = Math.max(0, Math.floor((sy - r - this.gy0) * S));
+    const j1 = Math.min(this.sh - 1, Math.ceil((sy + r - this.gy0) * S));
     const r2 = r * r;
 
-    for (let ty = y0; ty <= y1; ty++) {
-      const dy = ty + 0.5 - sy;
-      for (let tx = x0; tx <= x1; tx++) {
-        const dx = tx + 0.5 - sx;
+    for (let j = j0; j <= j1; j++) {
+      const py = this.gy0 + (j + 0.5) / S; // centro de la muestra, en bloques
+      const dy = py - sy;
+      for (let i = i0; i <= i1; i++) {
+        const px = this.gx0 + (i + 0.5) / S;
+        const dx = px - sx;
         const d2 = dx * dx + dy * dy;
         if (d2 >= r2) continue;
 
@@ -179,33 +190,41 @@ export class LightField {
         if (b < MIN_BRIGHTNESS) continue;
 
         this.raysCast++;
-        const tr = this.transmittance(sx, sy, tx, ty);
+        const tr = this.transmittance(sx, sy, px, py);
         if (tr <= 0) continue;
-        this.unlitBuf[(ty - this.gy0) * this.gw + (tx - this.gx0)] *= 1 - b * tr;
+        this.unlitBuf[j * this.sw + i] *= 1 - b * tr;
       }
     }
   }
 
-  /** Brillo (0..1) de una celda de la rejilla tras sumar todas las luces. Fuera de la rejilla es 0. */
+  /** Brillo (0..1) de un bloque: media de sus muestras. Fuera de la rejilla es 0. */
   brightnessAt(bx: number, by: number): number {
     const i = bx - this.gx0;
     const j = by - this.gy0;
     if (i < 0 || j < 0 || i >= this.gw || j >= this.gh) return 0;
-    return 1 - this.unlitBuf[j * this.gw + i];
+    const S = this.scale;
+    let sum = 0;
+    for (let dj = 0; dj < S; dj++) {
+      const row = (j * S + dj) * this.sw + i * S;
+      for (let di = 0; di < S; di++) sum += this.unlitBuf[row + di];
+    }
+    return 1 - sum / (S * S);
   }
 
   /**
-   * Rayo desde (sx, sy) hasta el centro de la celda (tx, ty), recorriendo las celdas con DDA.
+   * Rayo desde (sx, sy) hasta el punto (px, py), recorriendo las celdas con DDA.
    * Devuelve qué fracción de luz sobrevive: el producto de (1 - opacidad) de las celdas intermedias.
    * La celda de origen y la de destino no cuentan, así la cara iluminada de un muro sí recibe luz.
    */
-  private transmittance(sx: number, sy: number, tx: number, ty: number): number {
+  private transmittance(sx: number, sy: number, px: number, py: number): number {
+    const tx = Math.floor(px);
+    const ty = Math.floor(py);
     let cx = Math.floor(sx);
     let cy = Math.floor(sy);
     if (cx === tx && cy === ty) return 1;
 
-    const dx = tx + 0.5 - sx;
-    const dy = ty + 0.5 - sy;
+    const dx = px - sx;
+    const dy = py - sy;
     const stepX = dx > 0 ? 1 : -1;
     const stepY = dy > 0 ? 1 : -1;
     // Parámetro t del segmento (0..1) en el que se cruza el siguiente borde vertical / horizontal

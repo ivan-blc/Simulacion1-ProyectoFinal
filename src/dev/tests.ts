@@ -20,6 +20,7 @@ import type { InputState } from '../player/Player';
 import { TORCH_RECIPE, craftTorches } from '../items/crafting';
 import { AMBIENT, LightField, ambientAtDepth } from '../lighting/LightField';
 import { torchHasSupport } from '../world/torchRules';
+import { DarknessMap, blurInPlace } from '../lighting/darkness';
 import {
   CELLS,
   LAYER_COUNT,
@@ -30,6 +31,7 @@ import {
   cellSkyMask,
   layerArea,
 } from '../render/smoothing';
+
 
 
 function check(name: string, cond: boolean) {
@@ -795,4 +797,110 @@ export function runPhase9Tests() {
       ambientAtDepth(20) > 0 &&
       ambientAtDepth(200) === AMBIENT.MAX,
   );
+}
+
+export function runPhase10Tests() {
+  const setupScale = (w: WorldManager, scale: number) => {
+    const f = new LightField(12, scale);
+    f.begin(0, 45, 24, 18);
+    f.scan((cx, cy) => w.getChunk(cx, cy));
+    return f;
+  };
+  const world = flatWorld();
+
+  // Rejilla de muestras
+  {
+    const f = setupScale(world, 2);
+    check(
+      'supersampling x2: la rejilla de muestras tiene el doble en cada eje',
+      f.sw === 48 && f.sh === 36 && f.unlit.length === 48 * 36,
+    );
+  }
+
+  // Campo abierto con supersampling
+  {
+    const f = setupScale(world, 2);
+    f.addLight(10.5, 55.5, 8, 1);
+    const center = f.brightnessAt(10, 55);
+    check(
+      `supersampling x2: luz máxima en la fuente (${center.toFixed(2)}), decreciente y nula fuera del radio`,
+      center > 0.98 && f.brightnessAt(12, 55) > f.brightnessAt(16, 55) && f.brightnessAt(16, 55) > 0 && f.brightnessAt(19, 55) === 0,
+    );
+  }
+
+  // Penumbra: un bloque suelto da sombra parcial solo con supersampling
+  {
+    const blocked = flatWorld();
+    blocked.setBlock(13, 55, BlockId.STONE);
+    const hasPartialShadow = (scale: number): boolean => {
+      const free = setupScale(world, scale);
+      free.addLight(10.5, 55.5, 8, 1);
+      const blk = setupScale(blocked, scale);
+      blk.addLight(10.5, 55.5, 8, 1);
+      for (let y = 52; y <= 58; y++) {
+        for (let x = 14; x <= 19; x++) {
+          const a = free.brightnessAt(x, y);
+          if (a < 0.02) continue;
+          const ratio = blk.brightnessAt(x, y) / a;
+          if (ratio > 0.1 && ratio < 0.9) return true;
+        }
+      }
+      return false;
+    };
+    check('sin supersampling las sombras son todo o nada', !hasPartialShadow(1));
+    check('con supersampling x2 aparece una penumbra (sombras parciales)', hasPartialShadow(2));
+  }
+
+  // Desenfoque
+  {
+    const c = new Float32Array(16 * 8).fill(0.5);
+    blurInPlace(c, new Float32Array(16 * 8), 16, 8, 3);
+    check('blur: un campo constante no cambia', c.every((v) => Math.abs(v - 0.5) < 1e-6));
+
+    const spike = Float32Array.from([0, 0, 1, 0, 0]);
+    blurInPlace(spike, new Float32Array(5), 5, 1, 1);
+    check(
+      'blur: un pico se reparte como [0, ¼, ½, ¼, 0]',
+      [0, 0.25, 0.5, 0.25, 0].every((v, i) => Math.abs(spike[i] - v) < 1e-6),
+    );
+
+    const keep = Float32Array.from([0, 1, 0, 1]);
+    blurInPlace(keep, new Float32Array(4), 4, 1, 0);
+    check('blur: con 0 pasadas no toca nada', keep[0] === 0 && keep[1] === 1 && keep[2] === 0 && keep[3] === 1);
+
+    const w = 16;
+    const h = 8;
+    const edge = new Float32Array(w * h);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) edge[j * w + i] = i < 8 ? 1 : 0;
+    blurInPlace(edge, new Float32Array(w * h), w, h, 2);
+    let maxStep = 0;
+    let inRange = true;
+    for (let j = 0; j < h; j++) {
+      for (let i = 0; i < w; i++) {
+        const v = edge[j * w + i];
+        if (v < 0 || v > 1) inRange = false;
+        if (i < w - 1) maxStep = Math.max(maxStep, Math.abs(edge[j * w + i + 1] - v));
+      }
+    }
+    check(
+      `blur: un borde duro se reparte en varios escalones (salto máximo ${maxStep.toFixed(2)}) sin salirse de rango`,
+      maxStep < 0.5 && inRange,
+    );
+  }
+
+  // Mapa de oscuridad
+  {
+    const f = setupScale(world, 2);
+    f.addLight(10.5, 55.5, 8, 1);
+    const map = new DarknessMap();
+
+    map.update(f, new Array<number>(24).fill(0), 0); // superficie en y = 0: todo está muy profundo
+    check(
+      'oscuridad: casi nula junto a la luz y máxima lejos de ella',
+      map.data[21 * 48 + 21] < 0.05 && Math.abs(map.data[1 * 48 + 46] - AMBIENT.MAX) < 1e-6,
+    );
+
+    map.update(f, new Array<number>(24).fill(70), 2); // superficie bajo la rejilla: todo es cielo
+    check('oscuridad: nula sobre la superficie, incluso con el suavizado', map.data.every((v) => v === 0));
+  }
 }

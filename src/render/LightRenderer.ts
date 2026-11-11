@@ -1,6 +1,6 @@
 import { Sprite, Texture } from 'pixi.js';
 import { BLOCK_SIZE } from '../core/constants';
-import { ambientAtDepth } from '../lighting/LightField';
+import { DarknessMap } from '../lighting/darkness';
 import type { LightField } from '../lighting/LightField';
 
 // Color de la oscuridad: negro con un toque azul
@@ -11,7 +11,10 @@ const DARK_B = 14;
 export class LightRenderer {
   /** Añádelo al contenedor del mundo, por encima de entidades y partículas. */
   readonly sprite = new Sprite();
+  /** Pasadas del desenfoque que suaviza las sombras (0 = sin suavizado). */
+  blurPasses = 2;
 
+  private readonly map = new DarknessMap();
   private ctx: CanvasRenderingContext2D | null = null;
   private image: ImageData | null = null;
   private texture: Texture | null = null;
@@ -27,28 +30,19 @@ export class LightRenderer {
   }
 
   /**
-   * Convierte el campo de luz en una textura de 1 texel por bloque y la coloca sobre el mundo.
+   * Convierte el campo de luz en una textura de `scale` texels por bloque y la coloca sobre el mundo.
    * surf[i] = altura de la superficie en la columna i de la rejilla (para la oscuridad ambiental).
    */
   update(field: LightField, surf: ArrayLike<number>): void {
     const { gw, gh, gx0, gy0 } = field;
     if (gw <= 0 || gh <= 0) return;
-    if (!this.texture || gw !== this.w || gh !== this.h) this.allocate(gw, gh);
 
-    const data = this.image!.data;
-    const unlit = field.unlit;
-    for (let j = 0; j < gh; j++) {
-      const by = gy0 + j;
-      for (let i = 0; i < gw; i++) {
-        const k = j * gw + i;
-        const dark = ambientAtDepth(by - surf[i]) * unlit[k];
-        const o = k * 4;
-        data[o] = DARK_R;
-        data[o + 1] = DARK_G;
-        data[o + 2] = DARK_B;
-        data[o + 3] = Math.round(dark * 255);
-      }
-    }
+    this.map.update(field, surf, this.blurPasses);
+    const { w, h, data: dark } = this.map;
+    if (!this.texture || w !== this.w || h !== this.h) this.allocate(w, h);
+
+    const px = this.image!.data;
+    for (let k = 0, n = w * h; k < n; k++) px[k * 4 + 3] = Math.round(dark[k] * 255);
 
     this.ctx!.putImageData(this.image!, 0, 0);
     this.texture!.source.update(); // vuelve a subir la textura a la GPU
@@ -59,20 +53,27 @@ export class LightRenderer {
     this.sprite.visible = true;
   }
 
-  private allocate(gw: number, gh: number): void {
+  private allocate(w: number, h: number): void {
     this.texture?.destroy(true);
     const canvas = document.createElement('canvas');
-    canvas.width = gw;
-    canvas.height = gh;
+    canvas.width = w;
+    canvas.height = h;
     const ctx = canvas.getContext('2d')!;
     this.ctx = ctx;
-    this.image = ctx.createImageData(gw, gh);
+
+    const image = ctx.createImageData(w, h);
+    for (let k = 0, n = w * h; k < n; k++) {
+      image.data[k * 4] = DARK_R;
+      image.data[k * 4 + 1] = DARK_G;
+      image.data[k * 4 + 2] = DARK_B;
+    }
+    this.image = image;
 
     const tex = Texture.from(canvas);
-    tex.source.scaleMode = 'linear'; // el filtro bilineal suaviza la rejilla de bloques
+    tex.source.scaleMode = 'linear'; // el filtro bilineal suaviza lo que queda entre muestras
     this.texture = tex;
     this.sprite.texture = tex;
-    this.w = gw;
-    this.h = gh;
+    this.w = w;
+    this.h = h;
   }
 }

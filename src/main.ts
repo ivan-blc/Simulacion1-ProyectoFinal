@@ -15,6 +15,7 @@ import {
   runPhase7Tests,
   runPhase8Tests,
   runPhase9Tests,
+  runPhase10Tests,
   verifyWorkerChunk,
 } from './dev/tests';
 import { EnemyManager } from './entities/EnemyManager';
@@ -81,6 +82,7 @@ async function main() {
     runPhase7Tests();
     runPhase8Tests();
     runPhase9Tests();
+    runPhase10Tests();
   }
 
   // ?debug = mapa 2D · ?autostart = saltar el menú · ?seed=123 · ?reset = borrar guardado
@@ -285,8 +287,9 @@ async function main() {
   worldContainer.addChild(particles.container);
 
   // Iluminación: la oscuridad va encima de entidades y partículas, pero debajo del cursor
-  const lightField = new LightField(MAX_LIGHT_RADIUS);
   const lightRenderer = new LightRenderer();
+  const LIGHT_SCALE = 2; // muestras de luz por bloque y eje (1 = sin supersampling, 3 = más suave pero más caro)
+  const lightField = new LightField(MAX_LIGHT_RADIUS, LIGHT_SCALE);
   worldContainer.addChild(lightRenderer.sprite);
   const surfCols: number[] = [];
   let lightTime = 0;
@@ -447,6 +450,10 @@ async function main() {
       lighting = !lighting;
       ui.showMessage(lighting ? 'Iluminación activada' : 'Iluminación desactivada');
     }
+    if (k === 'k') {
+      lightRenderer.blurPasses = (lightRenderer.blurPasses + 1) % 4;
+      ui.showMessage(`Suavizado de sombras: ${lightRenderer.blurPasses} pasadas`);
+    }
     if (k === 'm') {
       const on = audio.setMusic(!audio.musicOn);
       ui.showMessage(on ? 'Música activada' : 'Música desactivada');
@@ -600,7 +607,7 @@ async function main() {
         lines.push(
           '── DEPURACIÓN ──',
           `fotograma más largo (0,25 s): ${frameMax.toFixed(1)} ms`,
-          `luz: ${lightField.lightsCast} fuentes · ${lightField.raysCast} rayos · ${lightMs.toFixed(2)} ms · rejilla ${lightField.gw}x${lightField.gh}`,
+          `luz: ${lightField.lightsCast} fuentes · ${lightField.raysCast} rayos · ${lightMs.toFixed(2)} ms · rejilla ${lightField.gw}x${lightField.gh} · muestras ${lightField.sw}x${lightField.sh} · blur ${lightRenderer.blurPasses}`,
           `chunks: cargados ${world.loadedCount} · visibles ${chunkRenderer.visibleCount} · pendientes ${world.pendingCount}`,
           pool
             ? `workers: ${pool.size} · en cola ${pool.queued} · en curso ${pool.inFlight} · gen. media ${pool.avgMs.toFixed(2)} ms · generados ${pool.completed}`

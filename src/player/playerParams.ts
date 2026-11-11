@@ -1,6 +1,6 @@
 export const PLAYER = {
-  WIDTH: 12,            // cabe en un hueco de 1 bloque de ancho
-  HEIGHT: 28,           // cabe en un túnel de 2 bloques de alto
+  WIDTH: 10,            // cabe en un hueco de 1 bloque de ancho - original 12
+  HEIGHT: 18,           // cabe en un túnel de 2 bloques de alto - original 28
 
   MOVE_SPEED: 160,      // px/s (10 bloques/s)
   GROUND_ACCEL: 1600,   // px/s² en suelo

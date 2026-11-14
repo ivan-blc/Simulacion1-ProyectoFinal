@@ -31,8 +31,8 @@ export function ranksFromSamples(samples: Uint8Array, out: Uint8Array): void {
 
 // Puntos de una celda (en unidades de bloque):
 // 0 TL, 1 TR, 2 BR, 3 BL, 4 punto medio arriba, 5 derecha, 6 abajo, 7 izquierda
-const PX = [0, 1, 1, 0, 0.5, 1, 0.5, 0];
-const PY = [0, 0, 1, 1, 0, 0.5, 1, 0.5];
+export const PX = [0, 1, 1, 0, 0.5, 1, 0.5, 0];
+export const PY = [0, 0, 1, 1, 0, 0.5, 1, 0.5];
 
 /**
  * Polígono sólido (convexo) de cada caso. Índice = TL*8 + TR*4 + BR*2 + BL.

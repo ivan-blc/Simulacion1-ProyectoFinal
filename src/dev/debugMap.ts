@@ -2,6 +2,7 @@ import { BlockId } from '../core/constants';
 import { blockToChunkCoord, blockToLocalCoord } from '../core/coords';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
+import type { GenParams } from '../world/genParams';
 
 const VIEW_W = 512; // bloques visibles en horizontal
 const VIEW_H = 256; // bloques visibles en vertical
@@ -18,16 +19,16 @@ const COLORS: Record<number, RGB> = {
   [BlockId.COAL]: [43, 43, 43],
   [BlockId.IRON]: [217, 164, 124],
   [BlockId.GOLD]: [242, 201, 76],
-  [BlockId.TORCH]: [255, 176, 46]
+  [BlockId.TORCH]: [255, 176, 46],
 };
 
 function makeWorld(gen: WorldGenerator): WorldManager {
   return new WorldManager((chunk) => gen.generateChunk(chunk));
 }
 
-export function showDebugMap(initialSeed: number): void {
+export function showDebugMap(initialSeed: number, params?: GenParams): void {
   let seed = initialSeed;
-  let gen = new WorldGenerator(seed);
+  let gen = new WorldGenerator(seed, params);
   let world = makeWorld(gen);
   let camX = -VIEW_W / 2;
   let camY = 30;
@@ -98,7 +99,7 @@ export function showDebugMap(initialSeed: number): void {
       case 'g': grid = !grid; break;
       case 'n':
         seed = Math.floor(Math.random() * 2 ** 31);
-        gen = new WorldGenerator(seed);
+        gen = new WorldGenerator(seed, params);
         world = makeWorld(gen);
         break;
       default: return;

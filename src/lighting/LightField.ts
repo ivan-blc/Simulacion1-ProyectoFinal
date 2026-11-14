@@ -19,12 +19,16 @@ export function ambientAtDepth(depth: number): number {
 const OPAQUE = new Float32Array(256);
 const EMIT_RADIUS = new Float32Array(256);
 const EMIT_INTENSITY = new Float32Array(256);
+const EMIT_SURFACE = new Uint8Array(256);
+/** Tope de fuentes "de superficie" (lava) por pasada, para acotar el coste de un lago grande. */
+const MAX_SURFACE_EMITTERS = 40;
 for (const [key, info] of Object.entries(BLOCK_INFO)) {
   const id = Number(key);
   OPAQUE[id] = info.solid ? 1 : 0;
   if (info.light) {
     EMIT_RADIUS[id] = info.light.radius;
     EMIT_INTENSITY[id] = info.light.intensity;
+    if (info.light.surfaceOnly) EMIT_SURFACE[id] = 1;
   }
 }
 
@@ -53,6 +57,7 @@ export class LightField {
 
   private opacity = new Float32Array(0);
   private unlitBuf = new Float32Array(0);
+  private prevIds = new Uint8Array(0);
   /** Fuentes encontradas en los bloques: [bx, by, radio, intensidad] repetido. */
   private readonly emitters: number[] = [];
 
@@ -78,6 +83,7 @@ export class LightField {
       this.sh = gh * this.scale;
       this.opacity = new Float32Array(this.ew * this.eh);
       this.unlitBuf = new Float32Array(this.sw * this.sh);
+      this.prevIds = new Uint8Array(this.ew);
     }
     this.gx0 = gx0;
     this.gy0 = gy0;
@@ -94,6 +100,8 @@ export class LightField {
   scan(getChunk: (cx: number, cy: number) => Chunk | undefined): void {
     const ex0 = this.gx0 - this.margin;
     const ey0 = this.gy0 - this.margin;
+    this.prevIds.fill(0);
+    let surfaceEmitters = 0;
 
     for (let j = 0; j < this.eh; j++) {
       const by = ey0 + j;
@@ -112,11 +120,24 @@ export class LightField {
         }
         if (!blocks) {
           this.opacity[j * this.ew + i] = 1;
+          this.prevIds[i] = 0;
           continue;
         }
         const id = blocks[ly * CHUNK_SIZE + (bx - cx * CHUNK_SIZE)];
+        const above = this.prevIds[i]; // lo que había encima (la fila anterior)
+        this.prevIds[i] = id;
         this.opacity[j * this.ew + i] = OPAQUE[id];
-        if (EMIT_RADIUS[id] > 0) this.emitters.push(bx, by, EMIT_RADIUS[id], EMIT_INTENSITY[id]);
+
+        if (EMIT_RADIUS[id] <= 0) continue;
+        if (EMIT_SURFACE[id] === 1) {
+          // Solo la superficie del lago emite, y con un tope
+          if (above !== id && surfaceEmitters < MAX_SURFACE_EMITTERS) {
+            surfaceEmitters++;
+            this.emitters.push(bx, by, EMIT_RADIUS[id], EMIT_INTENSITY[id]);
+          }
+        } else {
+          this.emitters.push(bx, by, EMIT_RADIUS[id], EMIT_INTENSITY[id]);
+        }
       }
     }
   }
@@ -150,6 +171,11 @@ export class LightField {
       const flicker = 1 + 0.05 * Math.sin(time * 7 + phase) + 0.025 * Math.sin(time * 17.3 + phase * 1.7);
       this.addLight(bx + 0.5, by + 0.4, e[k + 2] * flicker, e[k + 3]);
     }
+  }
+
+  /** Añade una fuente puntual para esta pasada (por ejemplo, la superficie de un lago de lava). Llamar después de scan(). */
+  addEmitter(bx: number, by: number, radius: number, intensity: number): void {
+    this.emitters.push(bx, by, radius, intensity);
   }
 
   /**

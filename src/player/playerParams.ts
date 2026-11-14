@@ -25,3 +25,16 @@ export const PLAYER = {
   KNOCKBACK_X: 220,     // retroceso al recibir daño (px/s)
   KNOCKBACK_Y: 250,
 } as const;
+
+export const LIQUID = {
+  WATER_SLOW: 0.6, // factor de velocidad horizontal en el agua
+  WATER_FRACTION: 0.3, // fracción del cuerpo cubierta de agua para considerarlo sumergido
+  LAVA_SLOW: 0.45,
+  GRAVITY_MULT: 0.3, // gravedad dentro de un líquido
+  MAX_FALL: 130, // velocidad máxima de caída dentro de un líquido (px/s)
+  SWIM_ACCEL: 2200, // aceleración al nadar hacia arriba (manteniendo el salto)
+  SWIM_UP: 170, // velocidad máxima de ascenso en el agua
+  LAVA_SWIM_UP: 90,
+  LAVA_DPS: 30, // daño por segundo en la lava
+  LAVA_TOUCH: 0.06, // fracción cubierta de lava para quemarse
+} as const;

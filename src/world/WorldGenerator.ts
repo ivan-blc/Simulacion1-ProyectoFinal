@@ -2,7 +2,8 @@ import { createNoise2D } from 'simplex-noise';
 import { BlockId, CHUNK_SIZE } from '../core/constants';
 import { hash2D, mulberry32 } from '../core/random';
 import type { Chunk } from './Chunk';
-import { GEN, ORES } from './genParams';
+import { DEFAULT_GEN_PARAMS, cloneGenParams } from './genParams';
+import type { GenParams } from './genParams';
 
 const CAVE_SALT = 0x5bd1e995;
 const DIRT_SALT = 7;
@@ -11,32 +12,45 @@ const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 export class WorldGenerator {
   readonly seed: number;
+  private params: GenParams;
   private readonly noise: ReturnType<typeof createNoise2D>;
 
-  constructor(seed: number) {
+  constructor(seed: number, params: GenParams = DEFAULT_GEN_PARAMS) {
     this.seed = seed | 0;
     this.noise = createNoise2D(mulberry32(this.seed));
+    this.params = cloneGenParams(params);
+  }
+
+  /** Cambia las reglas. El llamador debe regenerar los chunks que ya existan. */
+  setParams(params: GenParams): void {
+    this.params = cloneGenParams(params);
+  }
+
+  getParams(): GenParams {
+    return cloneGenParams(this.params);
   }
 
   /** Altura de la superficie (coordenada Y del bloque de pasto) en la columna bx. */
   surfaceHeight(bx: number): number {
+    const p = this.params;
+    const octaves = Math.max(1, Math.round(p.surfaceOctaves));
     let amp = 1;
-    let freq = GEN.SURFACE_FREQ;
+    let freq = p.surfaceFreq;
     let sum = 0;
     let norm = 0;
-    for (let o = 0; o < GEN.SURFACE_OCTAVES; o++) {
+    for (let o = 0; o < octaves; o++) {
       // el desplazamiento en Y distingue cada octava (ruido 1D sobre un plano 2D)
       sum += this.noise(bx * freq, o * 37.7) * amp;
       norm += amp;
       amp *= 0.5;
       freq *= 2;
     }
-    return Math.floor(GEN.SURFACE_BASE + (sum / norm) * GEN.SURFACE_AMPLITUDE);
+    return Math.floor(p.surfaceBase + (sum / norm) * p.surfaceAmplitude);
   }
 
   /** Mineral en (bx, by) o null. `depth` = bloques bajo la superficie de esa columna. */
   private oreAt(bx: number, by: number, depth: number): BlockId | null {
-    for (const ore of ORES) {
+    for (const ore of this.params.ores) {
       if (depth < ore.minDepth) continue;
       // El ruido es global y determinista: los filones no tienen costuras entre chunks
       const v = this.noise(bx * ore.freq + ore.offset, by * ore.freq + ore.offset * 0.7);
@@ -58,8 +72,12 @@ export class WorldGenerator {
     y0: number,
     w: number,
     h: number,
-    pad: number = GEN.CAVE_PAD,
+    pad: number = Math.max(this.params.cavePad, this.params.caveIterations),
   ): Uint8Array {
+    const p = this.params;
+    const iterations = Math.max(0, Math.round(p.caveIterations));
+    const ramp = Math.max(1, p.caveRamp);
+
     const W = w + 2 * pad;
     const H = h + 2 * pad;
     const ox = x0 - pad;
@@ -74,14 +92,14 @@ export class WorldGenerator {
       const surf = this.surfaceHeight(bx);
       for (let j = 0; j < H; j++) {
         const by = oy + j;
-        const t = clamp01((by - surf - GEN.CAVE_MIN_DEPTH) / GEN.CAVE_RAMP);
-        const solidChance = 1 - t * (1 - GEN.CAVE_SOLID_CHANCE);
+        const t = clamp01((by - surf - p.caveMinDepth) / ramp);
+        const solidChance = 1 - t * (1 - p.caveSolidChance);
         cur[j * W + i] = hash2D(bx, by, this.seed ^ CAVE_SALT) < solidChance ? 1 : 0;
       }
     }
 
     // 2) Autómatas celulares (fuera de la región se asume sólido)
-    for (let it = 0; it < GEN.CAVE_ITERATIONS; it++) {
+    for (let it = 0; it < iterations; it++) {
       for (let j = 0; j < H; j++) {
         for (let i = 0; i < W; i++) {
           let n = 0;
@@ -110,8 +128,9 @@ export class WorldGenerator {
     return out;
   }
 
-  /** Pipeline: superficie -> capas -> cuevas. Compatible con ChunkGenerator. */
+  /** Pipeline: superficie -> capas -> cuevas -> minerales. Compatible con ChunkGenerator. */
   generateChunk(chunk: Chunk): void {
+    const p = this.params;
     const x0 = chunk.cx * CHUNK_SIZE;
     const y0 = chunk.cy * CHUNK_SIZE;
     const lastY = y0 + CHUNK_SIZE - 1;
@@ -128,16 +147,14 @@ export class WorldGenerator {
     if (lastY < minH) return;
 
     // ¿Algún bloque del chunk está lo bastante hondo para tener cuevas?
-    const needCaves = lastY - minH >= GEN.CAVE_MIN_DEPTH;
-    const solid = needCaves
-      ? this.caveSolidRegion(x0, y0, CHUNK_SIZE, CHUNK_SIZE)
-      : null;
+    const needCaves = lastY - minH >= p.caveMinDepth;
+    const solid = needCaves ? this.caveSolidRegion(x0, y0, CHUNK_SIZE, CHUNK_SIZE) : null;
 
     for (let lx = 0; lx < CHUNK_SIZE; lx++) {
       const bx = x0 + lx;
       const h = heights[lx];
       const dirtDepth =
-        GEN.DIRT_MIN + Math.floor(hash2D(bx, 0, this.seed + DIRT_SALT) * (GEN.DIRT_VARIATION + 1));
+        p.dirtMin + Math.floor(hash2D(bx, 0, this.seed + DIRT_SALT) * (p.dirtVariation + 1));
 
       for (let ly = 0; ly < CHUNK_SIZE; ly++) {
         const by = y0 + ly;
@@ -145,12 +162,13 @@ export class WorldGenerator {
 
         let id: BlockId = by === h ? BlockId.GRASS : by <= h + dirtDepth ? BlockId.DIRT : BlockId.STONE;
 
-        if (solid && by - h >= GEN.CAVE_MIN_DEPTH && solid[ly * CHUNK_SIZE + lx] === 0) {
-          id = BlockId.AIR;
-        }
         if (id === BlockId.STONE) {
           const ore = this.oreAt(bx, by, by - h);
           if (ore !== null) id = ore;
+        }
+
+        if (solid && by - h >= p.caveMinDepth && solid[ly * CHUNK_SIZE + lx] === 0) {
+          id = BlockId.AIR;
         }
         chunk.blocks[ly * CHUNK_SIZE + lx] = id;
       }

@@ -5,7 +5,8 @@ import {
   worldToBlock,
 } from '../core/coords';
 import { Chunk } from '../world/Chunk';
-import { GEN, ORES } from '../world/genParams';
+import { DEFAULT_GEN_PARAMS, GEN, ORES, cloneGenParams } from '../world/genParams';
+import type { GenParams } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
 import { Player } from '../player/Player';
@@ -14,13 +15,19 @@ import { Enemy, SLIME } from '../entities/Enemy';
 import { EnemyManager } from '../entities/EnemyManager';
 import { HOTBAR_SIZE, Inventory, MAX_STACK } from '../items/Inventory';
 import { ObjectPool } from '../core/ObjectPool';
-import { seedFromText } from '../core/random';
+import { mulberry32, seedFromText } from '../core/random';
 import type { ChunkProvider } from '../world/WorldManager';
 import type { InputState } from '../player/Player';
 import { TORCH_RECIPE, craftTorches } from '../items/crafting';
 import { AMBIENT, LightField, ambientAtDepth } from '../lighting/LightField';
 import { torchHasSupport } from '../world/torchRules';
 import { DarknessMap, blurInPlace } from '../lighting/darkness';
+import { DEFAULT_ENEMY_PARAMS } from '../entities/enemyParams';
+import { sanitizeEnemyParams, sanitizeGenParams } from './devParams';
+import { ItemId, WANDS } from '../items/items';
+import { ProjectileSystem, aimAngle } from '../sim/Projectiles';
+import { CHUNK_PIX, PixelMat } from '../pixels/materials';
+import { PixelSim } from '../pixels/PixelSim';
 import {
   CELLS,
   LAYER_COUNT,
@@ -902,5 +909,544 @@ export function runPhase10Tests() {
 
     map.update(f, new Array<number>(24).fill(70), 2); // superficie bajo la rejilla: todo es cielo
     check('oscuridad: nula sobre la superficie, incluso con el suavizado', map.data.every((v) => v === 0));
+  }
+}
+
+export function runPhase11Tests() {
+  const withParams = (edit: (p: GenParams) => void): WorldGenerator => {
+    const p = cloneGenParams(DEFAULT_GEN_PARAMS);
+    edit(p);
+    return new WorldGenerator(12345, p);
+  };
+  /** Cuenta aire, piedra y minerales del chunk profundo (0, 8). */
+  const countDeep = (g: WorldGenerator) => {
+    const c = new Chunk(0, 8);
+    g.generateChunk(c);
+    let air = 0;
+    let stone = 0;
+    let ore = 0;
+    for (let i = 0; i < c.blocks.length; i++) {
+      const id = c.blocks[i];
+      if (id === BlockId.AIR) air++;
+      else if (id === BlockId.STONE) stone++;
+      else if (id >= BlockId.COAL && id <= BlockId.GOLD) ore++;
+    }
+    return { air, stone, ore };
+  };
+
+  // Copias de los parámetros
+  {
+    const c = cloneGenParams(DEFAULT_GEN_PARAMS);
+    c.ores[0].threshold = 0.123;
+    c.surfaceBase = 1;
+    check(
+      'cloneGenParams copia en profundidad',
+      DEFAULT_GEN_PARAMS.ores[0].threshold === ORES[0].threshold && DEFAULT_GEN_PARAMS.surfaceBase === GEN.SURFACE_BASE,
+    );
+  }
+  {
+    const p = cloneGenParams(DEFAULT_GEN_PARAMS);
+    const g = new WorldGenerator(12345, p);
+    const before = g.surfaceHeight(10);
+    p.surfaceBase += 30;
+    check('el generador copia los parámetros que recibe', g.surfaceHeight(10) === before);
+  }
+
+  // Superficie
+  {
+    const base = new WorldGenerator(12345);
+    const raised = withParams((p) => {
+      p.surfaceBase += 10;
+    });
+    const flat = withParams((p) => {
+      p.surfaceAmplitude = 0;
+    });
+    let up = true;
+    let isFlat = true;
+    for (let bx = -60; bx <= 60; bx++) {
+      if (raised.surfaceHeight(bx) !== base.surfaceHeight(bx) + 10) up = false;
+      if (flat.surfaceHeight(bx) !== GEN.SURFACE_BASE) isFlat = false;
+    }
+    check('surfaceBase +10 sube toda la superficie exactamente 10 bloques', up);
+    check('amplitud 0 da una superficie plana', isFlat);
+
+    const hot = new WorldGenerator(12345);
+    const p2 = cloneGenParams(DEFAULT_GEN_PARAMS);
+    p2.surfaceAmplitude = 0;
+    hot.setParams(p2);
+    check('setParams cambia el generador en caliente', hot.surfaceHeight(33) === GEN.SURFACE_BASE);
+  }
+
+  // Cuevas
+  check(
+    'densidad de roca 1: no hay cuevas',
+    countDeep(
+      withParams((p) => {
+        p.caveSolidChance = 1;
+      }),
+    ).air === 0,
+  );
+  check(
+    'densidad de roca 0: el chunk profundo queda totalmente hueco',
+    countDeep(
+      withParams((p) => {
+        p.caveSolidChance = 0;
+      }),
+    ).air ===
+      CHUNK_SIZE * CHUNK_SIZE,
+  );
+
+  // Minerales
+  check(
+    'umbral 2: no aparece ningún mineral',
+    countDeep(
+      withParams((p) => {
+        for (const o of p.ores) o.threshold = 2;
+      }),
+    ).ore === 0,
+  );
+  {
+    const r = countDeep(
+      withParams((p) => {
+        for (const o of p.ores) {
+          o.threshold = -2;
+          o.minDepth = 0;
+        }
+      }),
+    );
+    check('umbral -2 y profundidad 0: toda la piedra pasa a mineral', r.stone === 0 && r.ore > 0);
+  }
+
+  // Regenerar el mundo en marcha
+  {
+    const g = new WorldGenerator(12345);
+    const w = new WorldManager((c) => g.generateChunk(c));
+    const chunk = w.getOrCreateChunk(0, 8);
+    w.setBlock(5, 8 * CHUNK_SIZE + 4, BlockId.TORCH); // edición del jugador
+    chunk.isDirty = false;
+
+    const noCaves = cloneGenParams(DEFAULT_GEN_PARAMS);
+    noCaves.caveSolidChance = 1;
+    g.setParams(noCaves);
+    w.regenerateAll();
+
+    let air = 0;
+    for (let i = 0; i < chunk.blocks.length; i++) if (chunk.blocks[i] === BlockId.AIR) air++;
+    check('regenerateAll aplica las nuevas reglas a los chunks cargados', air === 0 && w.getChunk(0, 8) === chunk);
+    check('regenerateAll conserva las ediciones del jugador', w.getBlock(5, 8 * CHUNK_SIZE + 4) === BlockId.TORCH);
+    check('regenerateAll marca el chunk como sucio (se vuelve a dibujar)', chunk.isDirty);
+  }
+  {
+    const fp = new FakeProvider();
+    const w = new WorldManager();
+    w.setProvider(fp);
+    w.update(0, 0, 1);
+    w.regenerateAll();
+    check('regenerateAll descarta las solicitudes pendientes', w.pendingCount === 0);
+    w.update(0, 0, 1);
+    check('update vuelve a pedir los chunks tras regenerar', fp.requests.length === 18 && w.pendingCount === 9);
+  }
+
+  // Reglas de los enemigos
+  {
+    const w = flatWorld();
+    const p = landedPlayer(w);
+    const pcx = p.x + p.width / 2;
+    const pcy = p.y + p.height / 2;
+    const distTo = (e: Enemy): number => Math.abs(e.cx - pcx) / BLOCK_SIZE;
+
+    const off = new EnemyManager(w);
+    off.params.spawnEnabled = false;
+    off.update(2.1, p);
+    check('con la aparición desactivada no sale ningún enemigo', off.enemies.length === 0);
+
+    const none = new EnemyManager(w);
+    none.params.maxEnemies = 0;
+    none.update(2.1, p);
+    check('maxEnemies = 0 no deja aparecer enemigos', none.enemies.length === 0);
+
+    const near = new EnemyManager(w);
+    near.params.spawnMin = 10;
+    near.params.spawnMax = 12;
+    near.params.health = 55;
+    near.update(2.1, p);
+    const e = near.enemies[0];
+    check(
+      'la distancia de aparición respeta spawnMin y spawnMax',
+      e !== undefined && distTo(e) >= 9.5 && distTo(e) <= 11.5,
+    );
+    check('la vida de los enemigos nuevos sale de los parámetros', e !== undefined && e.health === 55);
+
+    const summoner = new EnemyManager(w);
+    const ok = summoner.summon(pcx, pcy);
+    check(
+      'summon crea un slime cerca del jugador',
+      ok && summoner.enemies.length === 1 && distTo(summoner.enemies[0]) >= 5.5 && distTo(summoner.enemies[0]) <= 13.5,
+    );
+
+    const timed = new EnemyManager(w);
+    timed.params.spawnInterval = 5;
+    timed.update(2.1, p);
+    const afterFirst = timed.enemies.length;
+    timed.update(2.5, p);
+    const afterSecond = timed.enemies.length;
+    timed.update(3, p);
+    check(
+      'el intervalo de aparición se respeta',
+      afterFirst === 1 && afterSecond === 1 && timed.enemies.length === 2,
+    );
+  }
+
+  // Saneado de valores (lo que se lee de localStorage)
+  {
+    const s = sanitizeGenParams({
+      surfaceBase: 99999,
+      caveSolidChance: -3,
+      surfaceOctaves: 2.7,
+      ores: [{ id: BlockId.COAL, minDepth: -50, threshold: 7 }],
+      basura: 1,
+    });
+    const coal = s.ores.find((o) => o.id === BlockId.COAL);
+    check(
+      'saneado: los valores fuera de rango se acotan y los enteros se redondean',
+      s.surfaceBase === 140 &&
+        s.caveSolidChance === 0.3 &&
+        s.surfaceOctaves === 3 &&
+        coal?.minDepth === 0 &&
+        coal.threshold === 1 &&
+        s.ores[0].minDepth === ORES[0].minDepth,
+    );
+  }
+  check(
+    'saneado: una entrada inválida devuelve los valores por defecto',
+    JSON.stringify(sanitizeGenParams(null)) === JSON.stringify(DEFAULT_GEN_PARAMS) &&
+      JSON.stringify(sanitizeGenParams('x')) === JSON.stringify(DEFAULT_GEN_PARAMS),
+  );
+  check(
+    'los valores por defecto están dentro de los rangos de los controles',
+    JSON.stringify(sanitizeGenParams(DEFAULT_GEN_PARAMS)) === JSON.stringify(DEFAULT_GEN_PARAMS) &&
+      JSON.stringify(sanitizeEnemyParams(DEFAULT_ENEMY_PARAMS)) === JSON.stringify(DEFAULT_ENEMY_PARAMS),
+  );
+  {
+    const e = sanitizeEnemyParams({ spawnMin: 50, spawnMax: 10, maxEnemies: 3.4, spawnEnabled: false });
+    check(
+      'saneado de enemigos: spawnMax > spawnMin, enteros y booleano',
+      e.spawnMax >= e.spawnMin + 1 && e.maxEnemies === 3 && e.spawnEnabled === false,
+    );
+  }
+}
+
+function pixWorld(rand: () => number = () => 0): { w: WorldManager; px: PixelSim } {
+  const w = flatWorld();
+  const px = new PixelSim(w, rand);
+  w.onBlockChanged = (bx, by) => px.onBlockChanged(bx, by);
+  return { w, px };
+}
+
+function stepPx(px: PixelSim, n: number): void {
+  for (let i = 0; i < n; i++) px.step();
+}
+
+/** Posiciones (rejilla global de celdas) de todos los píxeles de un material. */
+function findPixels(px: PixelSim, mat: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const l of px.layers.values()) {
+    for (let i = 0; i < l.cells.length; i++) {
+      if (l.cells[i] === mat) out.push([l.cx * CHUNK_PIX + (i % CHUNK_PIX), l.cy * CHUNK_PIX + Math.floor(i / CHUNK_PIX)]);
+    }
+  }
+  return out;
+}
+
+export function runPhase12Tests() {
+  // Varitas e inventario
+  check(
+    'las tres varitas lanzan arena, agua y lava como píxeles',
+    WANDS[ItemId.WAND_WATER].material === PixelMat.WATER &&
+      WANDS[ItemId.WAND_SAND].material === PixelMat.SAND &&
+      WANDS[ItemId.WAND_LAVA].material === PixelMat.LAVA,
+  );
+  {
+    const inv = new Inventory();
+    inv.add(ItemId.WAND_LAVA, 2);
+    check(
+      'las varitas no se apilan',
+      inv.slots[0]?.count === 1 && inv.slots[1]?.id === ItemId.WAND_LAVA && inv.slots[1]?.count === 1,
+    );
+    const r = new Inventory();
+    r.restore(`{"slots":[[${ItemId.WAND_WATER},1],[9,50],[99,3]],"selected":0}`);
+    check(
+      'restore acepta varitas y descarta los ids de bloques que ya no existen',
+      r.slots[0]?.id === ItemId.WAND_WATER && r.slots[1] === null && r.slots[2] === null,
+    );
+  }
+
+  // Puntería
+  {
+    const v = 340;
+    const g = 520;
+    let ok = true;
+    const targets: Array<[number, number]> = [[100, 0], [150, 30], [200, -40], [-120, 20]];
+    for (const [dx, dy] of targets) {
+      const a = aimAngle(dx, dy, v, g);
+      const t = dx / (v * Math.cos(a));
+      const y = v * Math.sin(a) * t - 0.5 * g * t * t;
+      if (!(t > 0) || Math.abs(y - dy) > 1) ok = false;
+    }
+    check('puntería: la parábola pasa por el objetivo (a derecha e izquierda)', ok);
+    check('puntería: fuera de alcance dispara a 45°', Math.abs(aimAngle(10000, 0, v, g) - Math.PI / 4) < 1e-9);
+    check(
+      'puntería: hacia la izquierda es el espejo de la derecha',
+      Math.abs(aimAngle(-100, 0, v, g) - (Math.PI - aimAngle(100, 0, v, g))) < 1e-9,
+    );
+  }
+
+  // Ediciones antiguas de bloques fluidos
+  {
+    const w = new WorldManager();
+    w.loadEdits(new Map([['0,1', [[5, 9], [6, BlockId.STONE]]]]));
+    w.getOrCreateChunk(0, 1);
+    check(
+      'las ediciones con ids de bloques que ya no existen se descartan al cargar',
+      w.getBlock(5, 32) === BlockId.AIR && w.getBlock(6, 32) === BlockId.STONE,
+    );
+  }
+
+  // Colisión suavizada: el mundo plano tiene el suelo en by = 64, o sea, en la celda 512
+  {
+    const { px } = pixWorld();
+    check('colisión: el suelo plano empieza exactamente en la celda 512', px.isSolidCell(40, 512) && !px.isSolidCell(40, 511));
+  }
+  {
+    const { w, px } = pixWorld();
+    w.setBlock(5, 62, BlockId.STONE);
+    check(
+      'colisión suavizada: un bloque aislado es un rombo (centro sólido, esquinas libres)',
+      px.isSolidCell(44, 500) && !px.isSolidCell(40, 496) && !px.isSolidCell(47, 503),
+    );
+  }
+
+  // Arena
+  {
+    const { px } = pixWorld();
+    px.deposit(40, 400, PixelMat.SAND);
+    stepPx(px, 80);
+    const p = findPixels(px, PixelMat.SAND);
+    check('arena: cae y se apoya en el suelo', p.length === 1 && p[0][0] === 40 && p[0][1] === 511);
+  }
+  {
+    const { px } = pixWorld(mulberry32(5));
+    for (let i = 0; i < 40; i++) {
+      px.deposit(100, 480, PixelMat.SAND);
+      stepPx(px, 4);
+    }
+    stepPx(px, 200);
+    const p = findPixels(px, PixelMat.SAND);
+    const heights = new Map<number, number>();
+    for (const [x] of p) heights.set(x, (heights.get(x) ?? 0) + 1);
+    const maxH = Math.max(...heights.values());
+    check(
+      `arena: 40 píxeles forman un montículo (${heights.size} columnas, altura máx. ${maxH})`,
+      p.length === 40 && heights.size >= 6 && maxH <= 12,
+    );
+  }
+  {
+    const { px } = pixWorld();
+    px.deposit(40, 511, PixelMat.WATER);
+    px.deposit(40, 510, PixelMat.SAND);
+    px.step();
+    check(
+      'arena: se hunde en el agua e intercambia posición',
+      px.peek(40, 511) === PixelMat.SAND && px.peek(40, 510) === PixelMat.WATER,
+    );
+  }
+
+  // Agua: una columna se reparte por el suelo y se queda quieta
+  {
+    const { px } = pixWorld(mulberry32(3));
+    for (let i = 0; i < 60; i++) px.deposit(100, 505 - i, PixelMat.WATER);
+    stepPx(px, 900);
+    const p = findPixels(px, PixelMat.WATER);
+    const heights = new Map<number, number>();
+    for (const [x] of p) heights.set(x, (heights.get(x) ?? 0) + 1);
+    const maxH = Math.max(...heights.values());
+    check(
+      `agua: una columna de 60 se reparte conservando el volumen (${heights.size} columnas, altura máx. ${maxH})`,
+      p.length === 60 && heights.size >= 12 && maxH <= 6,
+    );
+    px.step();
+    check('agua: el charco queda en reposo y su capa se duerme', px.activeLayers === 0);
+  }
+
+  // Agua + lava
+  {
+    const { px } = pixWorld();
+    let reacted = 0;
+    px.onReact = () => {
+      reacted++;
+    };
+    px.deposit(40, 511, PixelMat.LAVA);
+    px.deposit(41, 511, PixelMat.WATER);
+    px.step();
+    check(
+      'lava + agua: se anulan entre sí',
+      px.countMaterial(PixelMat.LAVA) === 0 && px.countMaterial(PixelMat.WATER) === 0,
+    );
+    check('lava + agua: avisa de la reacción una vez', reacted === 1);
+  }
+
+  // Un bloque colocado sobre un píxel lo elimina
+  {
+    const { w, px } = pixWorld();
+    px.deposit(44, 500, PixelMat.SAND);
+    w.setBlock(5, 62, BlockId.STONE);
+    px.step();
+    check('un bloque colocado sobre un píxel lo elimina', px.countMaterial(PixelMat.SAND) === 0);
+  }
+
+  // deposit, fraction y clearArea
+  {
+    const { px } = pixWorld();
+    px.deposit(40, 511, PixelMat.WATER);
+    const ok = px.deposit(40, 511, PixelMat.SAND);
+    check(
+      'deposit: si la celda está ocupada usa la libre más cercana por encima',
+      ok && px.peek(40, 510) === PixelMat.SAND && px.peek(40, 511) === PixelMat.WATER,
+    );
+  }
+  {
+    const { px } = pixWorld();
+    px.fillRect(0, 400, 15, 407, PixelMat.WATER); // rectángulo de 32 x 16 px del mundo
+    const full = px.fraction(0, 800, 32, 16, PixelMat.WATER);
+    const half = px.fraction(0, 800, 32, 32, PixelMat.WATER);
+    check(
+      'fraction mide la proporción de celdas de un material en un rectángulo',
+      Math.abs(full - 1) < 1e-9 && Math.abs(half - 0.5) < 1e-9 && px.fraction(0, 800, 32, 16, PixelMat.SAND) === 0,
+    );
+  }
+  {
+    const { px } = pixWorld();
+    px.fillRect(100, 400, 103, 403, PixelMat.SAND); // 16 celdas
+    px.deposit(600, 400, PixelMat.SAND); // lejos del área
+    const n = px.clearArea(12, 50, 2);
+    check('clearArea borra los píxeles del área y deja los demás', n === 16 && px.countMaterial(PixelMat.SAND) === 1);
+  }
+
+  // Luz de la lava: solo emite la superficie del lago
+  {
+    const { px } = pixWorld();
+    px.fillRect(64, 488, 111, 511, PixelMat.LAVA); // bloques 8..13 x 61..63
+    const spots: string[] = [];
+    const n = px.collectLava(0, 45, 24, 63, (bx, by) => spots.push(`${bx},${by}`), 40);
+    check(
+      'lava: solo emiten luz los bloques de la superficie del lago (6, no 18)',
+      n === 6 && spots.every((s) => s.endsWith(',61')),
+    );
+  }
+
+  // Reloj de la simulación
+  {
+    const { px } = pixWorld();
+    px.params.enabled = false;
+    px.update(1);
+    check('simulación desactivada: no avanza', px.ticks === 0);
+    px.params.enabled = true;
+    px.params.tickRate = 10;
+    px.update(5);
+    check('el reloj acota los ticks por frame a 3', px.ticks >= 2 && px.ticks <= 3);
+  }
+
+  // Proyectiles
+  {
+    const { w, px } = pixWorld();
+    const ps = new ProjectileSystem(px, new EnemyManager(w), () => 0.5);
+    const fired = ps.fire(WANDS[ItemId.WAND_WATER], 100, 900, 200, 900, 0.5);
+    check('varita: el ritmo de disparo se reparte por el tiempo', fired >= 22 && fired <= 24 && ps.list.length === fired);
+  }
+  {
+    const { w, px } = pixWorld();
+    const ps = new ProjectileSystem(px, new EnemyManager(w), () => 0.5);
+    ps.spawn(PixelMat.WATER, 88, 960, 0, 200, 3, 0); // celda (44, 480), cae hacia el suelo
+    for (let i = 0; i < 180 && ps.list.length > 0; i++) ps.update(1 / 60);
+    check(
+      'varita: el proyectil se convierte en un píxel en la última celda libre antes del suelo',
+      ps.list.length === 0 && px.peek(44, 511) === PixelMat.WATER,
+    );
+  }
+  {
+    const { w, px } = pixWorld();
+    const em = new EnemyManager(w);
+    const enemy = new Enemy(w, 100, 900);
+    em.enemies.push(enemy);
+    const ps = new ProjectileSystem(px, em, () => 0.5);
+    ps.spawn(PixelMat.SAND, 70, 906, 300, 0, 2, 0.6);
+    for (let i = 0; i < 30 && ps.list.length > 0; i++) ps.update(1 / 60);
+    check(
+      'varita: un proyectil con daño hiere al enemigo',
+      Math.abs(enemy.health - (SLIME.HEALTH - 0.6)) < 1e-9 && ps.list.length === 0,
+    );
+  }
+  {
+    const { w, px } = pixWorld();
+    const em = new EnemyManager(w);
+    const enemy = new Enemy(w, 100, 900);
+    em.enemies.push(enemy);
+    const ps = new ProjectileSystem(px, em, () => 0.5);
+    ps.spawn(PixelMat.WATER, 70, 906, 300, 0, 2, 0);
+    for (let i = 0; i < 30 && ps.list.length > 0; i++) ps.update(1 / 60);
+    check('varita: el agua empuja al enemigo sin herirlo', enemy.health === SLIME.HEALTH && enemy.vx > 0 && ps.list.length === 0);
+  }
+
+  // Jugador en agua y lava
+  {
+    const dry = landedPlayer(flatWorld());
+    const dryX0 = dry.x;
+    run(dry, 1, RIGHT);
+    const dryDist = dry.x - dryX0;
+
+    const { w, px } = pixWorld();
+    const wet = landedPlayer(w);
+    wet.fluids = px;
+    px.fillRect(0, 440, 300, 511, PixelMat.WATER);
+    wet.update(1 / 60, IDLE);
+    check('agua: el jugador sumergido lo detecta', wet.inWater && !wet.inLava);
+    const wetX0 = wet.x;
+    run(wet, 1, RIGHT);
+    check(
+      `agua: se avanza más despacio (${(wet.x - wetX0).toFixed(0)} px frente a ${dryDist.toFixed(0)} px en seco)`,
+      wet.x - wetX0 < dryDist * 0.8,
+    );
+  }
+  {
+    const { w, px } = pixWorld();
+    const p = landedPlayer(w);
+    p.fluids = px;
+    px.fillRect(0, 380, 300, 511, PixelMat.WATER);
+    const y0 = p.y;
+    run(p, 1, JUMP);
+    check('agua: mantener el salto hace nadar hacia arriba', p.y < y0 - 30);
+  }
+  {
+    const { w, px } = pixWorld();
+    const p = landedPlayer(w);
+    p.fluids = px;
+    px.fillRect(0, 490, 20, 511, PixelMat.LAVA);
+    const hp0 = p.health;
+    run(p, 1, IDLE);
+    check(
+      `lava: quema al jugador (≈ 30 de vida por segundo; perdió ${(hp0 - p.health).toFixed(0)})`,
+      p.inLava && p.health < hp0 - 20 && p.health > hp0 - 40,
+    );
+  }
+  {
+    const { w, px } = pixWorld();
+    const p = landedPlayer(w);
+    const em = new EnemyManager(w);
+    em.params.spawnEnabled = false;
+    em.fluids = px;
+    px.fillRect(140, 490, 170, 511, PixelMat.LAVA);
+    em.enemies.push(new Enemy(w, 300, 64 * BLOCK_SIZE - SLIME.HEIGHT));
+    em.update(1, p);
+    check('lava: quema a los enemigos hasta matarlos', em.enemies.length === 0);
   }
 }

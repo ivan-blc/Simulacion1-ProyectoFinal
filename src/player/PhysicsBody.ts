@@ -119,4 +119,26 @@ export class PhysicsBody {
       return;
     }
   }
+
+  /** Id del bloque en el centro de la caja. */
+  protected centerBlock(): number {
+    return this.world.getBlock(
+      Math.floor((this.x + this.width / 2) / BLOCK_SIZE),
+      Math.floor((this.y + this.height / 2) / BLOCK_SIZE),
+    );
+  }
+
+  /** ¿Alguna celda que toca la caja contiene este bloque? */
+  touchesBlock(id: number): boolean {
+    const x0 = Math.floor(this.x / BLOCK_SIZE);
+    const x1 = Math.floor((this.x + this.width - EPS) / BLOCK_SIZE);
+    const y0 = Math.floor(this.y / BLOCK_SIZE);
+    const y1 = Math.floor((this.y + this.height - EPS) / BLOCK_SIZE);
+    for (let by = y0; by <= y1; by++) {
+      for (let bx = x0; bx <= x1; bx++) {
+        if (this.world.getBlock(bx, by) === id) return true;
+      }
+    }
+    return false;
+  }
 }

@@ -1,7 +1,9 @@
 import { BLOCK_SIZE } from '../core/constants';
+import { PixelMat } from '../pixels/materials';
+import type { FluidSensor } from '../pixels/materials';
 import type { WorldManager } from '../world/WorldManager';
 import { PhysicsBody } from './PhysicsBody';
-import { PLAYER } from './playerParams';
+import { LIQUID, PLAYER } from './playerParams';
 
 export interface InputState {
   left: boolean;
@@ -19,6 +21,12 @@ export class Player extends PhysicsBody {
   readonly maxHealth: number = PLAYER.MAX_HEALTH;
   /** Segundos de invulnerabilidad restantes tras un golpe. */
   invuln = 0;
+  /** El centro del cuerpo está en agua. */
+  inWater = false;
+  /** El cuerpo toca lava. */
+  inLava = false;
+  /** Sensor de agua y lava de la simulación de píxeles (null = sin fluidos). */
+  fluids: FluidSensor | null = null;
 
   private coyote = 0;
   private jumpBuffer = 0;
@@ -40,6 +48,8 @@ export class Player extends PhysicsBody {
     this.jumping = false;
     this.health = this.maxHealth;
     this.invuln = 0;
+    this.inWater = false;
+    this.inLava = false;
   }
 
   update(dt: number, input: InputState): void {
@@ -47,6 +57,15 @@ export class Player extends PhysicsBody {
     if (clamped <= 0) return;
 
     if (this.invuln > 0) this.invuln = Math.max(0, this.invuln - clamped);
+        
+    // Agua y lava de píxeles: se miden una vez por frame sobre todo el cuerpo
+    const f = this.fluids;
+    this.inLava =
+      f !== null && f.fraction(this.x, this.y, this.width, this.height, PixelMat.LAVA) > LIQUID.LAVA_TOUCH;
+    this.inWater =
+      !this.inLava &&
+      f !== null &&
+      f.fraction(this.x, this.y, this.width, this.height, PixelMat.WATER) > LIQUID.WATER_FRACTION;
 
     // El salto se detecta por flanco (al pulsar), no mientras está pulsado
     if (input.jump && !this.jumpPrev) this.jumpBuffer = PLAYER.JUMP_BUFFER;
@@ -84,10 +103,14 @@ export class Player extends PhysicsBody {
   }
 
   private step(h: number, input: InputState): void {
+    // Líquidos: el agua se detecta en el centro del cuerpo; la lava, con solo tocarla
+    const inLiquid = this.inWater || this.inLava;
+    const slow = this.inLava ? LIQUID.LAVA_SLOW : this.inWater ? LIQUID.WATER_SLOW : 1;
+
     // Movimiento horizontal con aceleración
     const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
     const accel = this.onGround ? PLAYER.GROUND_ACCEL : PLAYER.AIR_ACCEL;
-    this.vx = approach(this.vx, dir * PLAYER.MOVE_SPEED, accel * h);
+    this.vx = approach(this.vx, dir * PLAYER.MOVE_SPEED * slow, accel * h);
 
     // Coyote time y buffer de salto
     this.coyote = this.onGround ? PLAYER.COYOTE_TIME : this.coyote - h;
@@ -110,7 +133,17 @@ export class Player extends PhysicsBody {
       }
     }
 
-    this.vy = Math.min(this.vy + PLAYER.GRAVITY * h, PLAYER.MAX_FALL);
+    // Nadar: mantener el salto empuja hacia arriba
+    if (inLiquid && input.jump) {
+      const swimUp = this.inLava ? LIQUID.LAVA_SWIM_UP : LIQUID.SWIM_UP;
+      this.vy = Math.max(this.vy - LIQUID.SWIM_ACCEL * h, -swimUp);
+    }
+
+    const gravity = inLiquid ? PLAYER.GRAVITY * LIQUID.GRAVITY_MULT : PLAYER.GRAVITY;
+    const maxFall = inLiquid ? LIQUID.MAX_FALL : PLAYER.MAX_FALL;
+    this.vy = Math.min(this.vy + gravity * h, maxFall);
+
+    if (this.inLava) this.health = Math.max(0, this.health - LIQUID.LAVA_DPS * h);
 
     // Primero X, luego Y
     this.moveX(this.vx * h);

@@ -1,23 +1,26 @@
 import { isSolidBlock } from '../core/blockInfo';
 import { BLOCK_SIZE } from '../core/constants';
+import { PixelMat } from '../pixels/materials';
+import type { FluidSensor } from '../pixels/materials';
+import { LIQUID } from '../player/playerParams';
 import { blockToChunkCoord, worldToBlockCoord } from '../core/coords';
 import type { Player } from '../player/Player';
 import type { WorldManager } from '../world/WorldManager';
 import { Enemy, SLIME } from './Enemy';
+import { DEFAULT_ENEMY_PARAMS } from './enemyParams';
+import type { EnemyParams } from './enemyParams';
 
-const SPAWN_MIN = 40;        // bloques de distancia horizontal mínima al aparecer
-const SPAWN_MAX = 55;
-const SPAWN_SCAN = 14;       // bloques arriba y abajo del jugador donde se busca suelo
-const SPAWN_INTERVAL = 3;    // s entre intentos de aparición
-const AGGRO = 30;            // bloques: a esta distancia empiezan a perseguir
-const DESPAWN_X = 70;        // bloques: más allá desaparecen
-const DESPAWN_Y = 50;
+const SPAWN_SCAN = 14; // bloques arriba y abajo del jugador donde se busca suelo
 
 export class EnemyManager {
   readonly enemies: Enemy[] = [];
-  maxEnemies = 6;
+  /** Reglas de aparición y de los enemigos. Se pueden modificar en caliente. */
+  readonly params: EnemyParams = { ...DEFAULT_ENEMY_PARAMS };
   onAdd?: (e: Enemy) => void;
   onRemove?: (e: Enemy) => void;
+  
+  /** Sensor de agua y lava de la simulación de píxeles. */
+  fluids: FluidSensor | null = null;
 
   private spawnTimer = 2;
   private readonly world: WorldManager;
@@ -27,13 +30,16 @@ export class EnemyManager {
   }
 
   update(dt: number, player: Player): void {
+    const p = this.params;
     const pcx = player.x + player.width / 2;
     const pcy = player.y + player.height / 2;
 
     this.spawnTimer -= dt;
     if (this.spawnTimer <= 0) {
-      this.spawnTimer = SPAWN_INTERVAL;
-      if (this.enemies.length < this.maxEnemies) this.trySpawn(pcx, pcy);
+      this.spawnTimer = p.spawnInterval;
+      if (p.spawnEnabled && this.enemies.length < p.maxEnemies) {
+        this.trySpawn(pcx, pcy, p.spawnMin, p.spawnMax);
+      }
     }
 
     for (let i = this.enemies.length - 1; i >= 0; i--) {
@@ -41,13 +47,23 @@ export class EnemyManager {
       const dx = pcx - e.cx;
       const dy = pcy - e.cy;
 
-      if (Math.abs(dx) > DESPAWN_X * BLOCK_SIZE || Math.abs(dy) > DESPAWN_Y * BLOCK_SIZE) {
+      if (Math.abs(dx) > p.despawnX * BLOCK_SIZE || Math.abs(dy) > p.despawnY * BLOCK_SIZE) {
         this.remove(e);
         continue;
       }
 
-      const aggro = Math.abs(dx) < AGGRO * BLOCK_SIZE && Math.abs(dy) < AGGRO * BLOCK_SIZE;
+      const aggro = Math.abs(dx) < p.aggroRange * BLOCK_SIZE && Math.abs(dy) < p.aggroRange * BLOCK_SIZE;
       e.update(dt, pcx, aggro);
+
+      // La lava quema a los enemigos
+      if (this.fluids && this.fluids.fraction(e.x, e.y, e.width, e.height, PixelMat.LAVA) > 0.1) {
+        e.health -= LIQUID.LAVA_DPS * dt;
+        e.hurtTimer = 0.2;
+        if (e.health <= 0) {
+          this.remove(e);
+          continue;
+        }
+      }
 
       // Daño por contacto (el retroceso empuja al jugador en sentido contrario al enemigo)
       const touching =
@@ -55,7 +71,7 @@ export class EnemyManager {
         e.x + e.width > player.x &&
         e.y < player.y + player.height &&
         e.y + e.height > player.y;
-      if (touching) player.hurt(SLIME.DAMAGE, dx >= 0 ? 1 : -1);
+      if (touching) player.hurt(p.contactDamage, dx >= 0 ? 1 : -1);
     }
   }
 
@@ -68,6 +84,14 @@ export class EnemyManager {
 
   clear(): void {
     for (const e of [...this.enemies]) this.remove(e);
+  }
+
+  /** Genera un enemigo cerca del jugador, ignorando el límite y el temporizador (herramienta de desarrollo). */
+  summon(pcx: number, pcy: number): boolean {
+    for (let i = 0; i < 10; i++) {
+      if (this.trySpawn(pcx, pcy, 6, 14)) return true;
+    }
+    return false;
   }
 
   /** Enemigo bajo el punto (px del mundo), con un margen opcional para facilitar el clic. */
@@ -89,12 +113,13 @@ export class EnemyManager {
     return this.world.getChunk(blockToChunkCoord(bx), blockToChunkCoord(by)) !== undefined;
   }
 
-  /** Busca suelo en una columna lejana: hueco libre con un bloque sólido debajo. */
-  private trySpawn(pcx: number, pcy: number): void {
+  /** Busca suelo en una columna a minDist..maxDist bloques: hueco libre con un bloque sólido debajo. */
+  private trySpawn(pcx: number, pcy: number, minDist: number, maxDist: number): boolean {
     const pbx = worldToBlockCoord(pcx);
     const pby = worldToBlockCoord(pcy);
     const side = Math.random() < 0.5 ? -1 : 1;
-    const bx = pbx + side * (SPAWN_MIN + Math.floor(Math.random() * (SPAWN_MAX - SPAWN_MIN)));
+    const span = Math.max(1, maxDist - minDist);
+    const bx = pbx + side * (minDist + Math.floor(Math.random() * span));
 
     for (let by = pby - SPAWN_SCAN; by <= pby + SPAWN_SCAN; by++) {
       if (!this.loaded(bx, by) || !this.loaded(bx, by + 1)) continue;
@@ -106,10 +131,12 @@ export class EnemyManager {
         this.world,
         bx * BLOCK_SIZE + (BLOCK_SIZE - SLIME.WIDTH) / 2,
         (by + 1) * BLOCK_SIZE - SLIME.HEIGHT,
+        this.params.health,
       );
       this.enemies.push(e);
       this.onAdd?.(e);
-      return;
+      return true;
     }
+    return false;
   }
 }

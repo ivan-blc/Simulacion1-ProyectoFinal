@@ -3,10 +3,18 @@ const SCALE = [0, 2, 4, 7, 9]; // pentatónica mayor
 const ROOT_HZ = 196; // sol3
 const STEP = 0.6; // segundos entre pasos de la música
 
-export type Sfx = 'mine' | 'place' | 'hit' | 'hurt' | 'death';
+export type Sfx = 'mine' | 'place' | 'hit' | 'hurt' | 'death' | 'zap' | 'hiss';
 
 /** Separación mínima entre dos reproducciones del mismo efecto (evita el ruido al arrastrar). */
-const MIN_GAP: Record<Sfx, number> = { mine: 0.05, place: 0.05, hit: 0.1, hurt: 0.3, death: 1 };
+const MIN_GAP: Record<Sfx, number> = {
+  mine: 0.05,
+  place: 0.05,
+  hit: 0.1,
+  hurt: 0.3,
+  death: 1,
+  zap: 0.12,
+  hiss: 0.25,
+};
 
 interface Graph {
   ctx: AudioContext;
@@ -125,6 +133,13 @@ export class AudioManager {
         break;
       case 'death':
         this.tone(g, 'sawtooth', 220, 40, 0.7, 0.22);
+        break;
+      case 'zap':
+        this.noiseBurst(g, 0.05, 0.08, 4500);
+        this.tone(g, 'sine', 620, 340, 0.07, 0.06);
+        break;
+      case 'hiss':
+        this.noiseBurst(g, 0.28, 0.12, 7000);
         break;
     }
   }

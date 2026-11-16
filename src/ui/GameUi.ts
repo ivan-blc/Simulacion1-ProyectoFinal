@@ -1,4 +1,4 @@
-import { BLOCK_INFO } from '../core/blockInfo';
+import { itemInfo } from '../items/items';
 import { HOTBAR_SIZE } from '../items/Inventory';
 import type { Inventory } from '../items/Inventory';
 
@@ -32,6 +32,9 @@ export class GameUi {
 
       const swatch = document.createElement('div');
       swatch.style.cssText =
+        'position:absolute;inset:9px;box-sizing:border-box;border:1px solid rgba(255,255,255,.3);' +
+        'display:flex;align-items:center;justify-content:center;' +
+        'font:bold 16px monospace;color:#fff;text-shadow:1px 1px 0 #000';
         'position:absolute;inset:9px;box-sizing:border-box;border:1px solid rgba(255,255,255,.3)';
 
       const count = document.createElement('span');
@@ -75,9 +78,12 @@ export class GameUi {
   render(): void {
     for (let i = 0; i < HOTBAR_SIZE; i++) {
       const slot = this.inventory.slots[i];
+      const info = slot ? itemInfo(slot.id) : null;
       this.slotEls[i].style.borderColor = i === this.inventory.selected ? '#fff' : '#555';
+      this.slotEls[i].title = info ? info.name : '';
       this.swatchEls[i].style.visibility = slot ? 'visible' : 'hidden';
-      this.swatchEls[i].style.background = slot ? BLOCK_INFO[slot.id].color : 'transparent';
+      this.swatchEls[i].style.background = info ? info.color : 'transparent';
+      this.swatchEls[i].textContent = info?.glyph ?? '';
       this.countEls[i].textContent = slot && slot.count > 1 ? String(slot.count) : '';
     }
   }

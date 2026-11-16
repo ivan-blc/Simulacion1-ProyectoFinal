@@ -6,6 +6,7 @@ import {
 } from '../core/coords';
 import { Chunk } from './Chunk';
 import type { EditList } from './ChunkStore';
+import { BLOCK_INFO } from '../core/blockInfo';
 
 export type ChunkGenerator = (chunk: Chunk) => void;
 
@@ -53,9 +54,11 @@ export class WorldManager {
     this.pending.clear();
   }
 
-  /** Cargar ediciones guardadas. Llamar ANTES de crear el primer chunk. */
+  /** Cargar ediciones guardadas. Llamar ANTES de crear el primer chunk. Los ids que ya no existen se descartan. */
   loadEdits(saved: Map<string, EditList>): void {
-    for (const [key, list] of saved) this.edits.set(key, new Map(list));
+    for (const [key, list] of saved) {
+      this.edits.set(key, new Map(list.filter(([, id]) => id in BLOCK_INFO)));
+    }
   }
 
   /** Devuelve las ediciones pendientes de guardar y vacía la cola. */
@@ -76,6 +79,11 @@ export class WorldManager {
 
   getChunk(cx: number, cy: number): Chunk | undefined {
     return this.chunks.get(chunkKey(cx, cy));
+  }
+
+  /** Los chunks cargados (para recorridos como la simulación de fluidos). */
+  chunkValues(): IterableIterator<Chunk> {
+    return this.chunks.values();
   }
 
   /** Cuántos chunks del cuadrado (2r+1)² centrado en (cx, cy) están cargados. */
@@ -115,6 +123,22 @@ export class WorldManager {
     chunk.blocks.set(blocks);
     this.register(chunk, key);
     return true;
+  }
+
+  /**
+   * Vuelve a generar TODOS los chunks cargados con el generador actual (se usa al cambiar las reglas
+   * de generación). Las ediciones del jugador se reaplican encima. Las solicitudes pendientes al
+   * provider se descartan: el siguiente update() las vuelve a pedir con las reglas nuevas.
+   */
+  regenerateAll(): void {
+    this.pending.clear();
+    for (const [key, chunk] of this.chunks) {
+      chunk.blocks.fill(0);
+      this.generator(chunk);
+      const saved = this.edits.get(key);
+      if (saved) for (const [i, id] of saved) chunk.blocks[i] = id;
+      chunk.isDirty = true;
+    }
   }
 
   /** Lectura: si el chunk no está cargado devuelve AIR (no lo genera). */

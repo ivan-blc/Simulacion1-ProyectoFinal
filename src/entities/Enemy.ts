@@ -14,15 +14,16 @@ export const SLIME = {
 } as const;
 
 export class Enemy extends PhysicsBody {
-  health: number = SLIME.HEALTH;
+  health: number;
   /** Segundos restantes del destello rojo tras un golpe. */
   hurtTimer = 0;
 
   private jumpTimer: number;
   private dir = 1;
 
-  constructor(world: WorldManager, x: number, y: number) {
+  constructor(world: WorldManager, x: number, y: number, health: number = SLIME.HEALTH) {
     super(world, SLIME.WIDTH, SLIME.HEIGHT, false);
+    this.health = health;
     this.x = x;
     this.y = y;
     this.jumpTimer = this.randomDelay();
@@ -36,12 +37,12 @@ export class Enemy extends PhysicsBody {
     return this.y + this.height / 2;
   }
 
-  /** Aplica daño con retroceso. Devuelve true si el enemigo muere. */
-  damage(amount: number, dirX: number): boolean {
+  /** Aplica daño con retroceso (`knock` lo escala: 1 = normal). Devuelve true si el enemigo muere. */
+  damage(amount: number, dirX: number, knock = 1): boolean {
     this.health -= amount;
     this.hurtTimer = 0.2;
-    this.vx = dirX * 160;
-    this.vy = -200;
+    this.vx = dirX * 160 * knock;
+    this.vy = -200 * knock;
     this.onGround = false;
     return this.health <= 0;
   }

@@ -48,7 +48,7 @@ export class ChunkRenderer {
   private readonly views = new Map<string, ChunkView>();
   private readonly opts: ChunkRendererOptions;
 
-  // Escena de trabajo: fondo por celdas + una malla por capa (nunca se añade al stage)
+  // Escena de trabajo: fondo por celdas + una malla por capa + antorchas (nunca se añade al stage)
   private readonly scratch = new Container();
   private readonly bgCells: Sprite[] = [];
   private readonly layers: LayerBuffers[] = [];

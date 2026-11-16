@@ -18,6 +18,13 @@ export class BlockEditor {
 
   /** Si es true, solo se puede construir junto a un bloque sólido (estilo Terraria). */
   requireSupport = false;
+  /** Si es true, el editor solo mueve el cursor: no mina ni construye (con una varita en la mano). */
+  suspended = false;
+  /** Estado del puntero, actualizado en cada update(): lo usan las varitas. */
+  pointerWorldX = 0;
+  pointerWorldY = 0;
+  leftDown = false;
+  rightDown = false;
 
   /** Alcance, inventario lleno, no construir dentro del jugador... */
   canEdit: (bx: number, by: number, placing: boolean) => boolean = () => true;
@@ -76,6 +83,8 @@ export class BlockEditor {
     this.cursor.visible = this.inside;
     if (!this.inside) {
       this.last = null;
+      this.leftDown = false;
+      this.rightDown = false;
       return;
     }
 
@@ -87,10 +96,19 @@ export class BlockEditor {
     const by = worldToBlockCoord(wy);
     this.hoverX = bx;
     this.hoverY = by;
+    this.pointerWorldX = wx;
+    this.pointerWorldY = wy;
     this.cursor.position.set(bx * BLOCK_SIZE, by * BLOCK_SIZE);
 
-    const mining = (this.buttons & 1) !== 0;
-    const placing = !mining && (this.buttons & 2) !== 0;
+    this.leftDown = (this.buttons & 1) !== 0;
+    this.rightDown = (this.buttons & 2) !== 0;
+    if (this.suspended) {
+      this.last = null;
+      return;
+    }
+
+    const mining = this.leftDown;
+    const placing = !mining && this.rightDown;
     if (!mining && !placing) {
       this.last = null;
       return;

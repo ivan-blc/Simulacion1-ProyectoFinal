@@ -6,6 +6,15 @@ export class Chunk {
   readonly blocks: Uint8Array = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE); // todo AIR (0)
   isDirty = true; // un chunk nuevo necesita su primer render
 
+  /** Nivel de agua por celda (0..LIQUID.MAX_LEVEL). Capa independiente de `blocks`. */
+  readonly liquid: Uint16Array = new Uint16Array(CHUNK_SIZE * CHUNK_SIZE);
+  /** Celdas con agua que la simulación debe revisar. No se guarda ni se envía desde los workers. */
+  readonly awake: Uint8Array = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE);
+  /** Cuántas celdas de `awake` están activas. */
+  awakeCount = 0;
+  /** El agua de este chunk cambió y está pendiente de guardar. */
+  liquidDirty = false;
+
   constructor(cx: number, cy: number) {
     this.cx = cx;
     this.cy = cy;

@@ -1,3 +1,4 @@
+import { isSolidBlock } from '../core/blockInfo';
 import { BlockId, CHUNK_SIZE } from '../core/constants';
 import {
   blockToChunkCoord,
@@ -6,7 +7,7 @@ import {
 } from '../core/coords';
 import { Chunk } from './Chunk';
 import type { EditList } from './ChunkStore';
-import { BLOCK_INFO } from '../core/blockInfo';
+import { LIQUID } from './liquidParams';
 
 export type ChunkGenerator = (chunk: Chunk) => void;
 
@@ -24,6 +25,14 @@ export class WorldManager {
   private readonly edits = new Map<string, Map<number, number>>();
   /** Chunks con ediciones pendientes de guardar. */
   private readonly modifiedKeys = new Set<string>();
+
+  /**
+   * Capa de agua de los chunks cuyo agua cambió (o se cargó del guardado). Guarda la referencia
+   * al array vivo, así que persiste aunque el chunk se descargue.
+   */
+  private readonly liquidState = new Map<string, Uint16Array>();
+  /** Chunks con agua pendiente de guardar. */
+  private readonly liquidModified = new Set<string>();
 
   /** Generación asíncrona: null = todo se genera de forma síncrona. */
   private provider: ChunkProvider | null = null;
@@ -54,11 +63,9 @@ export class WorldManager {
     this.pending.clear();
   }
 
-  /** Cargar ediciones guardadas. Llamar ANTES de crear el primer chunk. Los ids que ya no existen se descartan. */
+  /** Cargar ediciones guardadas. Llamar ANTES de crear el primer chunk. */
   loadEdits(saved: Map<string, EditList>): void {
-    for (const [key, list] of saved) {
-      this.edits.set(key, new Map(list.filter(([, id]) => id in BLOCK_INFO)));
-    }
+    for (const [key, list] of saved) this.edits.set(key, new Map(list));
   }
 
   /** Devuelve las ediciones pendientes de guardar y vacía la cola. */
@@ -77,13 +84,73 @@ export class WorldManager {
     this.modifiedKeys.add(key);
   }
 
-  getChunk(cx: number, cy: number): Chunk | undefined {
-    return this.chunks.get(chunkKey(cx, cy));
+  /** Cargar el agua guardada. Llamar ANTES de crear el primer chunk. */
+  loadLiquid(saved: Map<string, Uint16Array>): void {
+    for (const [key, layer] of saved) {
+      if (layer.length === CHUNK_SIZE * CHUNK_SIZE) this.liquidState.set(key, layer);
+    }
   }
 
-  /** Los chunks cargados (para recorridos como la simulación de fluidos). */
-  chunkValues(): IterableIterator<Chunk> {
-    return this.chunks.values();
+  /** Devuelve (copias de) las capas de agua pendientes de guardar y vacía la cola. */
+  takeModifiedLiquid(): Array<[string, Uint16Array]> {
+    const out: Array<[string, Uint16Array]> = [];
+    for (const key of this.liquidModified) {
+      const layer = this.liquidState.get(key);
+      if (layer) out.push([key, new Uint16Array(layer)]);
+      const chunk = this.chunks.get(key);
+      if (chunk) chunk.liquidDirty = false;
+    }
+    this.liquidModified.clear();
+    return out;
+  }
+
+  /** Para reintentar un guardado de agua fallido. */
+  markLiquidModified(key: string): void {
+    this.liquidModified.add(key);
+    const chunk = this.chunks.get(key);
+    if (chunk) chunk.liquidDirty = true;
+  }
+
+  /** Nivel de agua en (bx, by), o -1 si el chunk no está cargado. */
+  getLiquid(bx: number, by: number): number {
+    const chunk = this.getChunk(blockToChunkCoord(bx), blockToChunkCoord(by));
+    if (!chunk) return -1;
+    return chunk.liquid[blockToLocalCoord(by) * CHUNK_SIZE + blockToLocalCoord(bx)];
+  }
+
+  /** true si en (bx, by) hay un bloque sólido o el chunk no está cargado (el agua no puede entrar). */
+  isLiquidBlocked(bx: number, by: number): boolean {
+    const chunk = this.getChunk(blockToChunkCoord(bx), blockToChunkCoord(by));
+    if (!chunk) return true;
+    return isSolidBlock(chunk.blocks[blockToLocalCoord(by) * CHUNK_SIZE + blockToLocalCoord(bx)]);
+  }
+
+  /** Suma (o resta) agua en una celda, limitada a [0, MAX_LEVEL], y marca el chunk para guardar. */
+  addLiquid(bx: number, by: number, delta: number): void {
+    const chunk = this.getChunk(blockToChunkCoord(bx), blockToChunkCoord(by));
+    if (!chunk) return;
+    const i = blockToLocalCoord(by) * CHUNK_SIZE + blockToLocalCoord(bx);
+    const next = Math.max(0, Math.min(LIQUID.MAX_LEVEL, chunk.liquid[i] + delta));
+    if (next === chunk.liquid[i]) return;
+    chunk.liquid[i] = next;
+    this.touchLiquid(chunk);
+  }
+
+  /** Recorre los chunks cargados. */
+  forEachChunk(cb: (chunk: Chunk) => void): void {
+    for (const chunk of this.chunks.values()) cb(chunk);
+  }
+
+  private touchLiquid(chunk: Chunk): void {
+    if (chunk.liquidDirty) return;
+    chunk.liquidDirty = true;
+    const key = chunkKey(chunk.cx, chunk.cy);
+    this.liquidState.set(key, chunk.liquid);
+    this.liquidModified.add(key);
+  }
+
+  getChunk(cx: number, cy: number): Chunk | undefined {
+    return this.chunks.get(chunkKey(cx, cy));
   }
 
   /** Cuántos chunks del cuadrado (2r+1)² centrado en (cx, cy) están cargados. */
@@ -115,30 +182,16 @@ export class WorldManager {
    * Inserta un chunk generado por un worker. Devuelve false (y lo descarta)
    * si ya no se necesita: se canceló, se descargó o se generó de forma síncrona.
    */
-  insertGenerated(cx: number, cy: number, blocks: Uint8Array): boolean {
+  insertGenerated(cx: number, cy: number, blocks: Uint8Array, liquid?: Uint16Array): boolean {
     const key = chunkKey(cx, cy);
     if (!this.pending.delete(key)) return false;
     if (this.chunks.has(key) || blocks.length !== CHUNK_SIZE * CHUNK_SIZE) return false;
+    if (liquid && liquid.length !== CHUNK_SIZE * CHUNK_SIZE) return false;
     const chunk = new Chunk(cx, cy);
     chunk.blocks.set(blocks);
+    if (liquid) chunk.liquid.set(liquid);
     this.register(chunk, key);
     return true;
-  }
-
-  /**
-   * Vuelve a generar TODOS los chunks cargados con el generador actual (se usa al cambiar las reglas
-   * de generación). Las ediciones del jugador se reaplican encima. Las solicitudes pendientes al
-   * provider se descartan: el siguiente update() las vuelve a pedir con las reglas nuevas.
-   */
-  regenerateAll(): void {
-    this.pending.clear();
-    for (const [key, chunk] of this.chunks) {
-      chunk.blocks.fill(0);
-      this.generator(chunk);
-      const saved = this.edits.get(key);
-      if (saved) for (const [i, id] of saved) chunk.blocks[i] = id;
-      chunk.isDirty = true;
-    }
   }
 
   /** Lectura: si el chunk no está cargado devuelve AIR (no lo genera). */
@@ -222,10 +275,29 @@ export class WorldManager {
     }
   }
 
-  /** Aplica las ediciones guardadas, marca el chunk como sucio y avisa al render. */
+  /** Aplica las ediciones y el agua guardados, marca el chunk como sucio y avisa al render. */
   private register(chunk: Chunk, key: string): void {
     const saved = this.edits.get(key);
     if (saved) for (const [i, id] of saved) chunk.blocks[i] = id;
+
+    // Agua: la guardada sustituye a la generada. Después se limpia el agua que quedó dentro de
+    // bloques sólidos (por ejemplo, si el jugador colocó un bloque donde la semilla pone agua).
+    const savedLiquid = this.liquidState.get(key);
+    if (savedLiquid) chunk.liquid.set(savedLiquid);
+    let swept = false;
+    for (let i = 0; i < chunk.liquid.length; i++) {
+      if (chunk.liquid[i] > 0 && isSolidBlock(chunk.blocks[i])) {
+        chunk.liquid[i] = 0;
+        swept = true;
+      }
+    }
+    if (savedLiquid || swept) {
+      this.liquidState.set(key, chunk.liquid); // desde ahora, la referencia viva es la de este chunk
+      if (swept) {
+        this.liquidModified.add(key);
+        chunk.liquidDirty = true;
+      }
+    }
     chunk.isDirty = true;
     this.chunks.set(key, chunk);
     this.onChunkLoaded?.(chunk);

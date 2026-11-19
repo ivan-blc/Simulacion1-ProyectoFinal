@@ -3,8 +3,11 @@ import { blockToChunkCoord } from '../core/coords';
 import type { WorldManager } from '../world/WorldManager';
 import { PLAYER } from './playerParams';
 import { isSolidBlock } from '../core/blockInfo';
+import { LIQUID } from '../world/liquidParams';
 
 const EPS = 0.001;
+/** Alturas del cuerpo (fracción desde la cabeza) donde se mira si hay agua: cabeza, centro y pies. */
+const WATER_SAMPLES = [0.1, 0.5, 0.9] as const;
 
 /** Caja AABB que colisiona contra los bloques del mundo. La usan el jugador y los enemigos. */
 export class PhysicsBody {
@@ -42,6 +45,24 @@ export class PhysicsBody {
   /** ¿Está la caja dentro de bloques sólidos? */
   isOverlapping(): boolean {
     return this.overlapsSolid(this.x, this.y);
+  }
+
+  /** Fracción del cuerpo bajo el agua: 0, 1/3, 2/3 o 1 (se mira la cabeza, el centro y los pies). */
+  submerged(): number {
+    let n = 0;
+    for (const f of WATER_SAMPLES) if (this.waterAt(f)) n++;
+    return n / WATER_SAMPLES.length;
+  }
+
+  /** ¿Está la cabeza dentro del agua? */
+  headUnderwater(): boolean {
+    return this.waterAt(WATER_SAMPLES[0]);
+  }
+
+  private waterAt(fraction: number): boolean {
+    const bx = Math.floor((this.x + this.width / 2) / BLOCK_SIZE);
+    const by = Math.floor((this.y + this.height * fraction) / BLOCK_SIZE);
+    return this.world.getLiquid(bx, by) >= LIQUID.MAX_LEVEL * PLAYER.SWIM_MIN_LEVEL;
   }
 
   /** Un chunk sin cargar cuenta como sólido: nada cae al vacío. */
@@ -118,27 +139,5 @@ export class PhysicsBody {
       this.vy = 0;
       return;
     }
-  }
-
-  /** Id del bloque en el centro de la caja. */
-  protected centerBlock(): number {
-    return this.world.getBlock(
-      Math.floor((this.x + this.width / 2) / BLOCK_SIZE),
-      Math.floor((this.y + this.height / 2) / BLOCK_SIZE),
-    );
-  }
-
-  /** ¿Alguna celda que toca la caja contiene este bloque? */
-  touchesBlock(id: number): boolean {
-    const x0 = Math.floor(this.x / BLOCK_SIZE);
-    const x1 = Math.floor((this.x + this.width - EPS) / BLOCK_SIZE);
-    const y0 = Math.floor(this.y / BLOCK_SIZE);
-    const y1 = Math.floor((this.y + this.height - EPS) / BLOCK_SIZE);
-    for (let by = y0; by <= y1; by++) {
-      for (let bx = x0; bx <= x1; bx++) {
-        if (this.world.getBlock(bx, by) === id) return true;
-      }
-    }
-    return false;
   }
 }

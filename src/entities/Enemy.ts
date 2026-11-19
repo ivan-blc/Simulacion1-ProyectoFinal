@@ -11,19 +11,19 @@ export const SLIME = {
   JUMP_VX: 100,       // velocidad horizontal en el aire
   DELAY_MIN: 0.6,     // s entre saltos
   DELAY_MAX: 1.4,
+  SWIM_STROKE: 180,   // impulso hacia arriba en cada "brazada" dentro del agua
 } as const;
 
 export class Enemy extends PhysicsBody {
-  health: number;
+  health: number = SLIME.HEALTH;
   /** Segundos restantes del destello rojo tras un golpe. */
   hurtTimer = 0;
 
   private jumpTimer: number;
   private dir = 1;
 
-  constructor(world: WorldManager, x: number, y: number, health: number = SLIME.HEALTH) {
+  constructor(world: WorldManager, x: number, y: number) {
     super(world, SLIME.WIDTH, SLIME.HEIGHT, false);
-    this.health = health;
     this.x = x;
     this.y = y;
     this.jumpTimer = this.randomDelay();
@@ -37,12 +37,12 @@ export class Enemy extends PhysicsBody {
     return this.y + this.height / 2;
   }
 
-  /** Aplica daño con retroceso (`knock` lo escala: 1 = normal). Devuelve true si el enemigo muere. */
-  damage(amount: number, dirX: number, knock = 1): boolean {
+  /** Aplica daño con retroceso. Devuelve true si el enemigo muere. */
+  damage(amount: number, dirX: number): boolean {
     this.health -= amount;
     this.hurtTimer = 0.2;
-    this.vx = dirX * 160 * knock;
-    this.vy = -200 * knock;
+    this.vx = dirX * 160;
+    this.vy = -200;
     this.onGround = false;
     return this.health <= 0;
   }
@@ -58,6 +58,25 @@ export class Enemy extends PhysicsBody {
   }
 
   private step(h: number, targetX: number, aggro: boolean): void {
+    const swimming = this.submerged() >= PLAYER.SWIM_THRESHOLD;
+    if (swimming) {
+      // En el agua no hay suelo en el que apoyarse: da brazadas hacia el jugador y se hunde despacio
+      this.jumpTimer -= h;
+      if (aggro && this.jumpTimer <= 0) {
+        const dx = targetX - this.cx;
+        if (dx !== 0) this.dir = dx > 0 ? 1 : -1;
+        this.vy = -SLIME.SWIM_STROKE;
+        this.vx = this.dir * SLIME.JUMP_VX * PLAYER.SWIM_MOVE_MUL;
+        this.jumpTimer = this.randomDelay();
+      }
+      this.vy = Math.min(this.vy + PLAYER.SWIM_GRAVITY * h, PLAYER.SWIM_MAX_FALL);
+      this.vy *= Math.max(0, 1 - PLAYER.SWIM_DRAG * h);
+      this.vx *= Math.max(0, 1 - PLAYER.SWIM_DRAG * h);
+      this.moveX(this.vx * h);
+      this.moveY(this.vy * h);
+      return;
+    }
+
     if (this.onGround) {
       this.vx = 0; // al aterrizar no se desliza
       this.jumpTimer -= h;

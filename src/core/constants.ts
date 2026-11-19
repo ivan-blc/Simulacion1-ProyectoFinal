@@ -1,4 +1,4 @@
-export const BLOCK_SIZE = 16;
+export const BLOCK_SIZE = 16; //original 16
 export const CHUNK_SIZE = 32;
 
 export const BlockId = {

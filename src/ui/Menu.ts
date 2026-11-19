@@ -85,9 +85,7 @@ export function showTitleScreen(defaultSeedText: string, onGesture: () => void):
     );
     help.innerHTML =
       'A/D mover · Espacio saltar · clic izq. minar o atacar · clic der. construir<br>' +
-      'Varitas (agua, arena, lava): elígelas en la barra y mantén el clic izq. para lanzar<br>' +
-      '1-0 elegir slot · C antorchas · Esc pausa · M música · L luz' +
-      (import.meta.env.DEV ? ' · F1 herramientas de desarrollo' : '');
+      '1-0 elegir slot · Esc pausa · M música · L luz · F3 depuración';
 
     root.append(title, subtitle, label, play, random, fresh, help);
     document.body.appendChild(root);

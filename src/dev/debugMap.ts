@@ -1,8 +1,8 @@
 import { BlockId } from '../core/constants';
 import { blockToChunkCoord, blockToLocalCoord } from '../core/coords';
+import { LIQUID } from '../world/liquidParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
-import type { GenParams } from '../world/genParams';
 
 const VIEW_W = 512; // bloques visibles en horizontal
 const VIEW_H = 256; // bloques visibles en vertical
@@ -19,16 +19,16 @@ const COLORS: Record<number, RGB> = {
   [BlockId.COAL]: [43, 43, 43],
   [BlockId.IRON]: [217, 164, 124],
   [BlockId.GOLD]: [242, 201, 76],
-  [BlockId.TORCH]: [255, 176, 46],
+  [BlockId.TORCH]: [255, 176, 46]
 };
 
 function makeWorld(gen: WorldGenerator): WorldManager {
   return new WorldManager((chunk) => gen.generateChunk(chunk));
 }
 
-export function showDebugMap(initialSeed: number, params?: GenParams): void {
+export function showDebugMap(initialSeed: number): void {
   let seed = initialSeed;
-  let gen = new WorldGenerator(seed, params);
+  let gen = new WorldGenerator(seed);
   let world = makeWorld(gen);
   let camX = -VIEW_W / 2;
   let camY = 30;
@@ -72,6 +72,13 @@ export function showDebugMap(initialSeed: number, params?: GenParams): void {
         const id = world.getBlock(bx, by);
         let rgb: RGB = id === BlockId.AIR ? (by < heights[px] ? SKY : CAVE) : COLORS[id];
 
+        // Agua: se mezcla con azul según cuán llena esté la celda (sirve para ajustar WATER_LEVEL)
+        const water = world.getLiquid(bx, by);
+        if (water > 0) {
+          const k = 0.35 + 0.5 * Math.min(1, water / LIQUID.MAX_LEVEL);
+          rgb = [rgb[0] * (1 - k) + 44 * k, rgb[1] * (1 - k) + 108 * k, rgb[2] * (1 - k) + 214 * k];
+        }
+
         if (grid && (blockToLocalCoord(bx) === 0 || blockToLocalCoord(by) === 0)) {
           rgb = [rgb[0] * 0.6 + 255 * 0.4, rgb[1] * 0.6 + 255 * 0.4, rgb[2] * 0.6];
         }
@@ -86,7 +93,7 @@ export function showDebugMap(initialSeed: number, params?: GenParams): void {
 
     info.textContent =
       `semilla ${seed} · cámara (${camX}, ${camY}) · chunks cargados ${world.loadedCount} · ` +
-      `WASD/flechas mover (Shift = rápido) · G cuadrícula · N semilla nueva`;
+      `WASD/flechas mover (Shift = rápido) · G cuadrícula · N semilla nueva · azul = agua`;
   }
 
   window.addEventListener('keydown', (e) => {
@@ -99,7 +106,7 @@ export function showDebugMap(initialSeed: number, params?: GenParams): void {
       case 'g': grid = !grid; break;
       case 'n':
         seed = Math.floor(Math.random() * 2 ** 31);
-        gen = new WorldGenerator(seed, params);
+        gen = new WorldGenerator(seed);
         world = makeWorld(gen);
         break;
       default: return;

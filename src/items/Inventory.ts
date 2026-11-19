@@ -1,12 +1,13 @@
-import { BLOCK_STACK, isValidItem, maxStack } from './items';
+import { BLOCK_INFO } from '../core/blockInfo';
+import type { BlockId } from '../core/constants';
 
 export interface Slot {
-  id: number;
+  id: BlockId;
   count: number;
 }
 
 export const HOTBAR_SIZE = 10;
-export const MAX_STACK = BLOCK_STACK;
+export const MAX_STACK = 999;
 
 export class Inventory {
   readonly slots: Array<Slot | null> = Array.from({ length: HOTBAR_SIZE }, (): Slot | null => null);
@@ -20,29 +21,28 @@ export class Inventory {
     this.onChange?.();
   }
 
-  selectedItem(): number | null {
+  selectedItem(): BlockId | null {
     return this.slots[this.selected]?.id ?? null;
   }
 
-  canAdd(id: number, amount = 1): boolean {
-    const max = maxStack(id);
+  canAdd(id: BlockId, amount = 1): boolean {
     let room = 0;
     for (const s of this.slots) {
-      if (s === null) room += max;
-      else if (s.id === id) room += max - s.count;
+      if (s === null) room += MAX_STACK;
+      else if (s.id === id) room += MAX_STACK - s.count;
     }
     return room >= amount;
   }
 
   /** Total de unidades de un ítem en toda la barra. */
-  count(id: number): number {
+  count(id: BlockId): number {
     let n = 0;
     for (const s of this.slots) if (s && s.id === id) n += s.count;
     return n;
   }
 
   /** Quita unidades de un ítem repartidas por los slots. Si no hay suficientes, no quita nada y devuelve false. */
-  remove(id: number, amount = 1): boolean {
+  remove(id: BlockId, amount = 1): boolean {
     if (this.count(id) < amount) return false;
     let left = amount;
     for (let i = this.slots.length - 1; i >= 0 && left > 0; i--) {
@@ -58,20 +58,19 @@ export class Inventory {
   }
 
   /** Devuelve cuántas unidades NO cupieron (0 si cupo todo). */
-  add(id: number, amount = 1): number {
-    const max = maxStack(id);
+  add(id: BlockId, amount = 1): number {
     let left = amount;
     for (const s of this.slots) {
       if (left <= 0) break;
-      if (s && s.id === id && s.count < max) {
-        const n = Math.min(left, max - s.count);
+      if (s && s.id === id && s.count < MAX_STACK) {
+        const n = Math.min(left, MAX_STACK - s.count);
         s.count += n;
         left -= n;
       }
     }
     for (let i = 0; i < this.slots.length && left > 0; i++) {
       if (this.slots[i] === null) {
-        const n = Math.min(left, max);
+        const n = Math.min(left, MAX_STACK);
         this.slots[i] = { id, count: n };
         left -= n;
       }
@@ -111,9 +110,9 @@ export class Inventory {
         if (!Array.isArray(s)) continue;
         const id = Number(s[0]);
         const count = Number(s[1]);
-        if (!Number.isInteger(id) || !isValidItem(id)) continue;
+        if (!Number.isInteger(id) || id === 0 || !(id in BLOCK_INFO)) continue;
         if (!Number.isInteger(count) || count < 1) continue;
-        this.slots[i] = { id, count: Math.min(count, maxStack(id)) };
+        this.slots[i] = { id: id as BlockId, count: Math.min(count, MAX_STACK) };
       }
       const sel = Number(selected);
       this.selected = Number.isInteger(sel) && sel >= 0 && sel < HOTBAR_SIZE ? sel : 0;

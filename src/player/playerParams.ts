@@ -13,6 +13,17 @@ export const PLAYER = {
   COYOTE_TIME: 0.1,     // s de margen para saltar tras salir de un borde
   JUMP_BUFFER: 0.1,     // s de margen para saltar justo antes de aterrizar
 
+  // Nadar (ver docs/IMPLEMENTACION_AGUA.md)
+  SWIM_THRESHOLD: 0.5,  // fracción del cuerpo bajo el agua a partir de la cual nada
+  SWIM_MIN_LEVEL: 0.4,  // nivel de agua de una celda (0..1) para contar como "agua" al muestrear
+  SWIM_GRAVITY: 450,    // px/s² dentro del agua
+  SWIM_MAX_FALL: 140,   // velocidad máxima de caída en el agua (px/s)
+  SWIM_UP: 170,         // velocidad de ascenso al mantener saltar (px/s)
+  SWIM_ACCEL: 1200,     // px/s² para alcanzar SWIM_UP
+  SWIM_MOVE_MUL: 0.7,   // multiplicador de la velocidad horizontal
+  SWIM_DRAG: 3,         // rozamiento vertical por segundo
+  SWIM_EXIT_JUMP: 0.8,  // fracción del salto normal al salir del agua (con la cabeza fuera)
+
   AUTO_STEP: true,      // sube solo los escalones de 1 bloque
   REACH_BLOCKS: 6,      // alcance de minado y construcción
 
@@ -24,17 +35,4 @@ export const PLAYER = {
   INVULN_TIME: 1,       // s de invulnerabilidad tras recibir un golpe
   KNOCKBACK_X: 220,     // retroceso al recibir daño (px/s)
   KNOCKBACK_Y: 250,
-} as const;
-
-export const LIQUID = {
-  WATER_SLOW: 0.6, // factor de velocidad horizontal en el agua
-  WATER_FRACTION: 0.3, // fracción del cuerpo cubierta de agua para considerarlo sumergido
-  LAVA_SLOW: 0.45,
-  GRAVITY_MULT: 0.3, // gravedad dentro de un líquido
-  MAX_FALL: 130, // velocidad máxima de caída dentro de un líquido (px/s)
-  SWIM_ACCEL: 2200, // aceleración al nadar hacia arriba (manteniendo el salto)
-  SWIM_UP: 170, // velocidad máxima de ascenso en el agua
-  LAVA_SWIM_UP: 90,
-  LAVA_DPS: 30, // daño por segundo en la lava
-  LAVA_TOUCH: 0.06, // fracción cubierta de lava para quemarse
 } as const;

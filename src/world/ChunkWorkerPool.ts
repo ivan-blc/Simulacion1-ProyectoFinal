@@ -1,4 +1,3 @@
-import type { GenParams } from './genParams';
 import type { WorkerRequest, WorkerResponse } from './workerMessages';
 import type { ChunkProvider } from './WorldManager';
 
@@ -6,9 +5,8 @@ const MAX_IN_FLIGHT_PER_WORKER = 2;
 
 export interface ChunkWorkerPoolOptions {
   seed: number;
-  params: GenParams;
   size: number;
-  onResult: (cx: number, cy: number, blocks: Uint8Array, ms: number) => void;
+  onResult: (cx: number, cy: number, blocks: Uint8Array, liquid: Uint16Array, ms: number) => void;
   /** Un worker falló: el llamador debe volver a generar en el hilo principal. */
   onFatal: (err: unknown) => void;
 }
@@ -19,8 +17,6 @@ export class ChunkWorkerPool implements ChunkProvider {
 
   private totalMs = 0;
   private dead = false;
-  /** Sube cada vez que cambian las reglas de generación. */
-  private epoch = 0;
   private readonly workers: Worker[] = [];
   private readonly inFlightPer: number[] = [];
   private readonly queue: Array<{ cx: number; cy: number }> = [];
@@ -32,7 +28,7 @@ export class ChunkWorkerPool implements ChunkProvider {
     try {
       for (let i = 0; i < this.size; i++) {
         const worker = new Worker(new URL('./chunkWorker.ts', import.meta.url), { type: 'module' });
-        const init: WorkerRequest = { type: 'init', seed: opts.seed, params: opts.params, epoch: this.epoch };
+        const init: WorkerRequest = { type: 'init', seed: opts.seed };
         worker.postMessage(init);
         worker.onmessage = (e: MessageEvent<WorkerResponse>) => this.handle(i, e.data);
         worker.onerror = (e) => this.fatal(e);
@@ -70,19 +66,6 @@ export class ChunkWorkerPool implements ChunkProvider {
     if (i >= 0) this.queue.splice(i, 1);
   }
 
-  /**
-   * Cambia las reglas de generación en todos los workers. Las peticiones en cola se descartan y los
-   * resultados en vuelo (generados con las reglas antiguas) se ignoran al llegar. El WorldManager
-   * debe volver a pedir lo que le falte (regenerateAll + update).
-   */
-  setParams(params: GenParams): void {
-    if (this.dead) return;
-    this.epoch++;
-    this.queue.length = 0;
-    const msg: WorkerRequest = { type: 'config', params, epoch: this.epoch };
-    for (const w of this.workers) w.postMessage(msg);
-  }
-
   dispose(): void {
     this.dead = true;
     this.terminate();
@@ -113,11 +96,9 @@ export class ChunkWorkerPool implements ChunkProvider {
   private handle(i: number, msg: WorkerResponse): void {
     if (this.dead) return;
     this.inFlightPer[i]--;
-    if (msg.epoch === this.epoch) {
-      this.completed++;
-      this.totalMs += msg.ms;
-      this.opts.onResult(msg.cx, msg.cy, new Uint8Array(msg.buffer), msg.ms);
-    }
+    this.completed++;
+    this.totalMs += msg.ms;
+    this.opts.onResult(msg.cx, msg.cy, new Uint8Array(msg.buffer), new Uint16Array(msg.liquid), msg.ms);
     this.pump();
   }
 

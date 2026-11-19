@@ -5,8 +5,7 @@ import {
   worldToBlock,
 } from '../core/coords';
 import { Chunk } from '../world/Chunk';
-import { DEFAULT_GEN_PARAMS, GEN, ORES, cloneGenParams } from '../world/genParams';
-import type { GenParams } from '../world/genParams';
+import { GEN, ORES } from '../world/genParams';
 import { WorldGenerator } from '../world/WorldGenerator';
 import { WorldManager } from '../world/WorldManager';
 import { Player } from '../player/Player';
@@ -15,19 +14,16 @@ import { Enemy, SLIME } from '../entities/Enemy';
 import { EnemyManager } from '../entities/EnemyManager';
 import { HOTBAR_SIZE, Inventory, MAX_STACK } from '../items/Inventory';
 import { ObjectPool } from '../core/ObjectPool';
-import { mulberry32, seedFromText } from '../core/random';
+import { seedFromText } from '../core/random';
 import type { ChunkProvider } from '../world/WorldManager';
 import type { InputState } from '../player/Player';
 import { TORCH_RECIPE, craftTorches } from '../items/crafting';
 import { AMBIENT, LightField, ambientAtDepth } from '../lighting/LightField';
 import { torchHasSupport } from '../world/torchRules';
+import { LIQUID } from '../world/liquidParams';
+import { LiquidSim } from '../world/LiquidSim';
+import { PLAYER } from '../player/playerParams';
 import { DarknessMap, blurInPlace } from '../lighting/darkness';
-import { DEFAULT_ENEMY_PARAMS } from '../entities/enemyParams';
-import { sanitizeEnemyParams, sanitizeGenParams } from './devParams';
-import { ItemId, WANDS } from '../items/items';
-import { ProjectileSystem, aimAngle } from '../sim/Projectiles';
-import { CHUNK_PIX, PixelMat } from '../pixels/materials';
-import { PixelSim } from '../pixels/PixelSim';
 import {
   CELLS,
   LAYER_COUNT,
@@ -85,7 +81,7 @@ export function runPhase1Tests() {
   check('tras moverse hay 25 chunks', w2.loadedCount === 25);
 }
 
-function sameArray(a: Uint8Array, b: Uint8Array): boolean {
+function sameArray(a: ArrayLike<number>, b: ArrayLike<number>): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
@@ -481,12 +477,13 @@ export function verifyWorkerChunk(
   cy: number,
   blocks: Uint8Array,
   ms: number,
+  liquid?: Uint16Array,
 ): void {
   const ref = new Chunk(cx, cy);
   gen.generateChunk(ref);
   check(
     `worker: el chunk (${cx},${cy}) es idéntico al generado en el hilo principal (${ms.toFixed(1)} ms)`,
-    sameArray(ref.blocks, blocks),
+    sameArray(ref.blocks, blocks) && (!liquid || sameArray(ref.liquid, liquid)),
   );
 }
 
@@ -911,542 +908,452 @@ export function runPhase10Tests() {
     check('oscuridad: nula sobre la superficie, incluso con el suavizado', map.data.every((v) => v === 0));
   }
 }
+// ---------------------------------------------------------------------------------------------
+// Fase 11: agua (ver docs/IMPLEMENTACION_AGUA.md)
+// ---------------------------------------------------------------------------------------------
+
+/** Mundo cuyos chunks se construyen con `build` (los chunks sin cargar actúan como pared para el agua). */
+function waterWorld(build: (chunk: Chunk, set: (lx: number, ly: number, id: number) => void) => void): {
+  world: WorldManager;
+  sim: LiquidSim;
+} {
+  const world = new WorldManager((chunk) =>
+    build(chunk, (lx, ly, id) => {
+      chunk.blocks[ly * CHUNK_SIZE + lx] = id;
+    }),
+  );
+  const sim = new LiquidSim(world);
+  world.onChunkLoaded = (c) => sim.onChunkLoaded(c);
+  world.onBlockChanged = (bx, by) => sim.onBlockChanged(bx, by);
+  return { world, sim };
+}
+
+function awakeTotal(world: WorldManager): number {
+  let n = 0;
+  world.forEachChunk((c) => (n += c.awakeCount));
+  return n;
+}
+
+function liquidTotal(world: WorldManager): number {
+  let n = 0;
+  world.forEachChunk((c) => {
+    for (let i = 0; i < c.liquid.length; i++) n += c.liquid[i];
+  });
+  return n;
+}
+
+/** Avanza la simulación hasta que todo duerma. Devuelve los ticks usados. */
+function settle(sim: LiquidSim, world: WorldManager, maxTicks = 30000): number {
+  let t = 0;
+  while (awakeTotal(world) > 0 && t < maxTicks) {
+    sim.update(1 / LIQUID.TICK_HZ);
+    t++;
+  }
+  return t;
+}
+
+/** Despierta el agua puesta a mano después de crear el chunk. */
+function wakeAll(sim: LiquidSim, world: WorldManager): void {
+  world.forEachChunk((c) => sim.onChunkLoaded(c));
+}
+
+/** Recipiente: paredes en los bordes izquierdo y derecho (lx <= wl, lx >= wr) y suelo desde la fila `floor`. */
+function basin(wl: number, wr: number, floor = 30) {
+  return (_c: Chunk, set: (lx: number, ly: number, id: number) => void) => {
+    for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        if (lx <= wl || lx >= wr || ly >= floor) set(lx, ly, BlockId.STONE);
+      }
+    }
+  };
+}
 
 export function runPhase11Tests() {
-  const withParams = (edit: (p: GenParams) => void): WorldGenerator => {
-    const p = cloneGenParams(DEFAULT_GEN_PARAMS);
-    edit(p);
-    return new WorldGenerator(12345, p);
-  };
-  /** Cuenta aire, piedra y minerales del chunk profundo (0, 8). */
-  const countDeep = (g: WorldGenerator) => {
-    const c = new Chunk(0, 8);
-    g.generateChunk(c);
-    let air = 0;
-    let stone = 0;
-    let ore = 0;
-    for (let i = 0; i < c.blocks.length; i++) {
-      const id = c.blocks[i];
-      if (id === BlockId.AIR) air++;
-      else if (id === BlockId.STONE) stone++;
-      else if (id >= BlockId.COAL && id <= BlockId.GOLD) ore++;
-    }
-    return { air, stone, ore };
-  };
+  const MAX = LIQUID.MAX_LEVEL;
 
-  // Copias de los parámetros
+  // --- Reglas del autómata (las mismas que se validaron en el simulador aislado) ---
+
+  // Caja cerrada: tres chorros caen y se nivelan; el volumen se conserva
   {
-    const c = cloneGenParams(DEFAULT_GEN_PARAMS);
-    c.ores[0].threshold = 0.123;
-    c.surfaceBase = 1;
-    check(
-      'cloneGenParams copia en profundidad',
-      DEFAULT_GEN_PARAMS.ores[0].threshold === ORES[0].threshold && DEFAULT_GEN_PARAMS.surfaceBase === GEN.SURFACE_BASE,
-    );
-  }
-  {
-    const p = cloneGenParams(DEFAULT_GEN_PARAMS);
-    const g = new WorldGenerator(12345, p);
-    const before = g.surfaceHeight(10);
-    p.surfaceBase += 30;
-    check('el generador copia los parámetros que recibe', g.surfaceHeight(10) === before);
+    const { world, sim } = waterWorld(basin(1, 30));
+    world.getOrCreateChunk(0, 0);
+    for (const x of [5, 6, 15]) world.addLiquid(x, 0, MAX);
+    wakeAll(sim, world);
+    const ticks = settle(sim, world);
+    const row = Array.from({ length: 28 }, (_, i) => world.getLiquid(2 + i, 29));
+    let adjacent = 0;
+    for (let i = 1; i < row.length; i++) adjacent = Math.max(adjacent, Math.abs(row[i] - row[i - 1]));
+    let above = 0;
+    for (let y = 0; y < 29; y++) for (let x = 2; x <= 29; x++) above += world.getLiquid(x, y);
+    check(`agua: la caja se queda dormida (${ticks} ticks)`, awakeTotal(world) === 0 && ticks < 30000);
+    const boxTotal = liquidTotal(world);
+    check(`agua: el volumen se conserva en la caja (${boxTotal} de ${3 * MAX}; solo se pierde por evaporación)`, boxTotal <= 3 * MAX && boxTotal >= 3 * MAX * 0.99);
+    check('agua: celdas vecinas del fondo difieren como mucho 1 nivel', adjacent <= 1);
+    check('agua: nada queda flotando sobre la fila del fondo', above === 0);
   }
 
-  // Superficie
+  // Pozo vertical: el agua se apila abajo
   {
-    const base = new WorldGenerator(12345);
-    const raised = withParams((p) => {
-      p.surfaceBase += 10;
-    });
-    const flat = withParams((p) => {
-      p.surfaceAmplitude = 0;
-    });
-    let up = true;
-    let isFlat = true;
-    for (let bx = -60; bx <= 60; bx++) {
-      if (raised.surfaceHeight(bx) !== base.surfaceHeight(bx) + 10) up = false;
-      if (flat.surfaceHeight(bx) !== GEN.SURFACE_BASE) isFlat = false;
-    }
-    check('surfaceBase +10 sube toda la superficie exactamente 10 bloques', up);
-    check('amplitud 0 da una superficie plana', isFlat);
-
-    const hot = new WorldGenerator(12345);
-    const p2 = cloneGenParams(DEFAULT_GEN_PARAMS);
-    p2.surfaceAmplitude = 0;
-    hot.setParams(p2);
-    check('setParams cambia el generador en caliente', hot.surfaceHeight(33) === GEN.SURFACE_BASE);
-  }
-
-  // Cuevas
-  check(
-    'densidad de roca 1: no hay cuevas',
-    countDeep(
-      withParams((p) => {
-        p.caveSolidChance = 1;
-      }),
-    ).air === 0,
-  );
-  check(
-    'densidad de roca 0: el chunk profundo queda totalmente hueco',
-    countDeep(
-      withParams((p) => {
-        p.caveSolidChance = 0;
-      }),
-    ).air ===
-      CHUNK_SIZE * CHUNK_SIZE,
-  );
-
-  // Minerales
-  check(
-    'umbral 2: no aparece ningún mineral',
-    countDeep(
-      withParams((p) => {
-        for (const o of p.ores) o.threshold = 2;
-      }),
-    ).ore === 0,
-  );
-  {
-    const r = countDeep(
-      withParams((p) => {
-        for (const o of p.ores) {
-          o.threshold = -2;
-          o.minDepth = 0;
+    const { world, sim } = waterWorld((_c, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+        for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+          if (lx === 9 || lx === 11 || ly >= 30) set(lx, ly, BlockId.STONE);
         }
-      }),
-    );
-    check('umbral -2 y profundidad 0: toda la piedra pasa a mineral', r.stone === 0 && r.ore > 0);
-  }
-
-  // Regenerar el mundo en marcha
-  {
-    const g = new WorldGenerator(12345);
-    const w = new WorldManager((c) => g.generateChunk(c));
-    const chunk = w.getOrCreateChunk(0, 8);
-    w.setBlock(5, 8 * CHUNK_SIZE + 4, BlockId.TORCH); // edición del jugador
-    chunk.isDirty = false;
-
-    const noCaves = cloneGenParams(DEFAULT_GEN_PARAMS);
-    noCaves.caveSolidChance = 1;
-    g.setParams(noCaves);
-    w.regenerateAll();
-
-    let air = 0;
-    for (let i = 0; i < chunk.blocks.length; i++) if (chunk.blocks[i] === BlockId.AIR) air++;
-    check('regenerateAll aplica las nuevas reglas a los chunks cargados', air === 0 && w.getChunk(0, 8) === chunk);
-    check('regenerateAll conserva las ediciones del jugador', w.getBlock(5, 8 * CHUNK_SIZE + 4) === BlockId.TORCH);
-    check('regenerateAll marca el chunk como sucio (se vuelve a dibujar)', chunk.isDirty);
-  }
-  {
-    const fp = new FakeProvider();
-    const w = new WorldManager();
-    w.setProvider(fp);
-    w.update(0, 0, 1);
-    w.regenerateAll();
-    check('regenerateAll descarta las solicitudes pendientes', w.pendingCount === 0);
-    w.update(0, 0, 1);
-    check('update vuelve a pedir los chunks tras regenerar', fp.requests.length === 18 && w.pendingCount === 9);
-  }
-
-  // Reglas de los enemigos
-  {
-    const w = flatWorld();
-    const p = landedPlayer(w);
-    const pcx = p.x + p.width / 2;
-    const pcy = p.y + p.height / 2;
-    const distTo = (e: Enemy): number => Math.abs(e.cx - pcx) / BLOCK_SIZE;
-
-    const off = new EnemyManager(w);
-    off.params.spawnEnabled = false;
-    off.update(2.1, p);
-    check('con la aparición desactivada no sale ningún enemigo', off.enemies.length === 0);
-
-    const none = new EnemyManager(w);
-    none.params.maxEnemies = 0;
-    none.update(2.1, p);
-    check('maxEnemies = 0 no deja aparecer enemigos', none.enemies.length === 0);
-
-    const near = new EnemyManager(w);
-    near.params.spawnMin = 10;
-    near.params.spawnMax = 12;
-    near.params.health = 55;
-    near.update(2.1, p);
-    const e = near.enemies[0];
-    check(
-      'la distancia de aparición respeta spawnMin y spawnMax',
-      e !== undefined && distTo(e) >= 9.5 && distTo(e) <= 11.5,
-    );
-    check('la vida de los enemigos nuevos sale de los parámetros', e !== undefined && e.health === 55);
-
-    const summoner = new EnemyManager(w);
-    const ok = summoner.summon(pcx, pcy);
-    check(
-      'summon crea un slime cerca del jugador',
-      ok && summoner.enemies.length === 1 && distTo(summoner.enemies[0]) >= 5.5 && distTo(summoner.enemies[0]) <= 13.5,
-    );
-
-    const timed = new EnemyManager(w);
-    timed.params.spawnInterval = 5;
-    timed.update(2.1, p);
-    const afterFirst = timed.enemies.length;
-    timed.update(2.5, p);
-    const afterSecond = timed.enemies.length;
-    timed.update(3, p);
-    check(
-      'el intervalo de aparición se respeta',
-      afterFirst === 1 && afterSecond === 1 && timed.enemies.length === 2,
-    );
-  }
-
-  // Saneado de valores (lo que se lee de localStorage)
-  {
-    const s = sanitizeGenParams({
-      surfaceBase: 99999,
-      caveSolidChance: -3,
-      surfaceOctaves: 2.7,
-      ores: [{ id: BlockId.COAL, minDepth: -50, threshold: 7 }],
-      basura: 1,
+      }
     });
-    const coal = s.ores.find((o) => o.id === BlockId.COAL);
+    world.getOrCreateChunk(0, 0);
+    for (let y = 0; y < 3; y++) world.addLiquid(10, y, MAX);
+    wakeAll(sim, world);
+    settle(sim, world);
     check(
-      'saneado: los valores fuera de rango se acotan y los enteros se redondean',
-      s.surfaceBase === 140 &&
-        s.caveSolidChance === 0.3 &&
-        s.surfaceOctaves === 3 &&
-        coal?.minDepth === 0 &&
-        coal.threshold === 1 &&
-        s.ores[0].minDepth === ORES[0].minDepth,
+      'agua: en un pozo se apila abajo y no queda nada arriba',
+      [27, 28, 29].every((y) => world.getLiquid(10, y) === MAX) &&
+        Array.from({ length: 27 }, (_, y) => world.getLiquid(10, y)).every((v) => v === 0),
     );
   }
-  check(
-    'saneado: una entrada inválida devuelve los valores por defecto',
-    JSON.stringify(sanitizeGenParams(null)) === JSON.stringify(DEFAULT_GEN_PARAMS) &&
-      JSON.stringify(sanitizeGenParams('x')) === JSON.stringify(DEFAULT_GEN_PARAMS),
-  );
-  check(
-    'los valores por defecto están dentro de los rangos de los controles',
-    JSON.stringify(sanitizeGenParams(DEFAULT_GEN_PARAMS)) === JSON.stringify(DEFAULT_GEN_PARAMS) &&
-      JSON.stringify(sanitizeEnemyParams(DEFAULT_ENEMY_PARAMS)) === JSON.stringify(DEFAULT_ENEMY_PARAMS),
-  );
+
+  // Reparto simétrico
   {
-    const e = sanitizeEnemyParams({ spawnMin: 50, spawnMax: 10, maxEnemies: 3.4, spawnEnabled: false });
+    const { world, sim } = waterWorld(basin(1, 29));
+    world.getOrCreateChunk(0, 0);
+    for (let y = 27; y < 30; y++) world.addLiquid(15, y, MAX);
+    wakeAll(sim, world);
+    settle(sim, world);
+    let left = 0;
+    let right = 0;
+    for (let y = 0; y < 30; y++) {
+      for (let x = 2; x < 15; x++) left += world.getLiquid(x, y);
+      for (let x = 16; x < 29; x++) right += world.getLiquid(x, y);
+    }
+    check(`agua: reparto casi simétrico (${left} / ${right})`, Math.abs(left - right) <= MAX * 0.1);
+  }
+
+  // Un lago sellado duerme; al minar el muro, fluye y vuelve a dormir
+  {
+    const { world, sim } = waterWorld((_c, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+        for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+          if (lx <= 1 || lx >= 30 || ly >= 30 || (lx === 15 && ly >= 20)) set(lx, ly, BlockId.STONE);
+        }
+      }
+    });
+    world.getOrCreateChunk(0, 0);
+    for (let y = 20; y < 30; y++) for (let x = 2; x < 15; x++) world.addLiquid(x, y, MAX);
+    wakeAll(sim, world);
+    settle(sim, world);
+    const initial = liquidTotal(world);
+    const sleeping = awakeTotal(world) === 0;
+    let rightBefore = 0;
+    for (let y = 0; y < 30; y++) for (let x = 16; x < 30; x++) rightBefore += world.getLiquid(x, y);
+
+    world.setBlock(15, 29, BlockId.AIR); // se mina el muro por abajo
+    const woke = awakeTotal(world) > 0;
+    settle(sim, world);
+    let right = 0;
+    for (let y = 0; y < 30; y++) for (let x = 16; x < 30; x++) right += world.getLiquid(x, y);
+    check('agua: un lago sellado está dormido (no cuesta nada)', sleeping && rightBefore === 0);
+    let left = 0;
+    for (let y = 0; y < 30; y++) for (let x = 2; x < 15; x++) left += world.getLiquid(x, y);
+    check('agua: minar el muro despierta el agua', woke);
     check(
-      'saneado de enemigos: spawnMax > spawnMin, enteros y booleano',
-      e.spawnMax >= e.spawnMin + 1 && e.maxEnemies === 3 && e.spawnEnabled === false,
+      'agua: al abrir el muro, el agua pasa al otro lado y el lago baja (sin presión no se equilibran los niveles)',
+      right > 0 && left < initial,
+    );
+    check('agua: tras fluir, el volumen se conserva (salvo la evaporación)', liquidTotal(world) >= initial * 0.98);
+    check('agua: y vuelve a dormir', awakeTotal(world) === 0);
+  }
+
+  // Un lago sobre una cueva: al abrir el suelo se vacía hacia la cuenca de abajo
+  {
+    const { world, sim } = waterWorld((_c, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+        for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+          const lakeWall = (lx === 4 || lx === 25) && ly >= 5 && ly <= 14;
+          const lakeFloor = ly === 15 && lx >= 4 && lx <= 25;
+          if (lx <= 1 || lx >= 30 || ly >= 30 || lakeWall || lakeFloor) set(lx, ly, BlockId.STONE);
+        }
+      }
+    });
+    world.getOrCreateChunk(0, 0);
+    for (let y = 5; y <= 14; y++) for (let x = 5; x <= 24; x++) world.addLiquid(x, y, MAX);
+    wakeAll(sim, world);
+    settle(sim, world);
+    const initial = liquidTotal(world);
+    world.setBlock(15, 15, BlockId.AIR); // se abre el suelo del lago
+    const ticks = settle(sim, world);
+    let lake = 0;
+    for (let y = 5; y <= 14; y++) for (let x = 5; x <= 24; x++) lake += world.getLiquid(x, y);
+    check(
+      `agua: un lago con el suelo abierto se vacía hacia la cuenca de abajo (${ticks} ticks, ${Math.round((lake / initial) * 100)} % queda arriba)`,
+      lake < initial * 0.05 && liquidTotal(world) >= initial * 0.98 && awakeTotal(world) === 0,
     );
   }
-}
 
-function pixWorld(rand: () => number = () => 0): { w: WorldManager; px: PixelSim } {
-  const w = flatWorld();
-  const px = new PixelSim(w, rand);
-  w.onBlockChanged = (bx, by) => px.onBlockChanged(bx, by);
-  return { w, px };
-}
+  // Entre chunks: pasa al vecino cargado; un vecino sin cargar actúa como pared
+  {
+    const { world, sim } = waterWorld((chunk, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+        for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+          const wall = (chunk.cx === 0 && lx === 0) || (chunk.cx === 1 && lx === 31);
+          if (ly >= 30 || wall) set(lx, ly, BlockId.STONE);
+        }
+      }
+    });
+    world.getOrCreateChunk(0, 0);
+    world.getOrCreateChunk(1, 0);
+    for (let y = 27; y < 30; y++) world.addLiquid(30, y, MAX);
+    wakeAll(sim, world);
+    settle(sim, world);
+    const inRight = world.getChunk(1, 0)!.liquid.reduce((a, b) => a + b, 0);
+    check('agua: cruza el límite entre chunks', inRight > 0);
+    check(`agua: cruzar chunks conserva el volumen (${liquidTotal(world)} de ${3 * MAX}; solo se pierde por evaporación)`, liquidTotal(world) <= 3 * MAX && liquidTotal(world) >= 3 * MAX * 0.9);
 
-function stepPx(px: PixelSim, n: number): void {
-  for (let i = 0; i < n; i++) px.step();
-}
+    const solo = waterWorld((_chunk, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+        for (let lx = 0; lx < CHUNK_SIZE; lx++) if (ly >= 30 || lx === 0) set(lx, ly, BlockId.STONE);
+      }
+    });
+    solo.world.getOrCreateChunk(0, 0);
+    for (let y = 27; y < 30; y++) solo.world.addLiquid(31, y, MAX);
+    wakeAll(solo.sim, solo.world);
+    settle(solo.sim, solo.world);
+    check(
+      'agua: un chunk sin cargar actúa como pared (el agua no se escapa)',
+      solo.world.getLiquid(32, 29) === -1 && solo.world.getChunk(0, 0)!.liquid.reduce((a, b) => a + b, 0) === liquidTotal(solo.world) && liquidTotal(solo.world) >= 3 * MAX * 0.9,
+    );
+  }
 
-/** Posiciones (rejilla global de celdas) de todos los píxeles de un material. */
-function findPixels(px: PixelSim, mat: number): Array<[number, number]> {
-  const out: Array<[number, number]> = [];
-  for (const l of px.layers.values()) {
-    for (let i = 0; i < l.cells.length; i++) {
-      if (l.cells[i] === mat) out.push([l.cx * CHUNK_PIX + (i % CHUNK_PIX), l.cy * CHUNK_PIX + Math.floor(i / CHUNK_PIX)]);
+  // Colocar un bloque sólido sobre agua
+  {
+    const { world } = waterWorld((_c, set) => {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) for (let ly = 30; ly < CHUNK_SIZE; ly++) set(lx, ly, BlockId.STONE);
+    });
+    world.getOrCreateChunk(0, 0);
+    world.addLiquid(10, 29, MAX);
+    world.setBlock(10, 29, BlockId.STONE);
+    check(
+      'agua: al colocar un bloque, el agua desplazada sube a la celda de arriba',
+      world.getLiquid(10, 29) === 0 && world.getLiquid(10, 28) === MAX,
+    );
+    world.addLiquid(20, 29, MAX);
+    world.addLiquid(20, 28, MAX);
+    world.setBlock(20, 29, BlockId.STONE);
+    check(
+      'agua: si arriba no cabe, el agua desplazada se pierde (la celda sólida queda en 0)',
+      world.getLiquid(20, 29) === 0 && world.getLiquid(20, 28) === MAX,
+    );
+  }
+
+  // Presupuesto: nunca se procesan más celdas por tick que CELL_BUDGET
+  {
+    const { world, sim } = waterWorld(() => {});
+    for (let cx = -1; cx <= 1; cx++) for (let cy = 0; cy <= 2; cy++) world.getOrCreateChunk(cx, cy).liquid.fill(MAX);
+    wakeAll(sim, world);
+    sim.update(1 / LIQUID.TICK_HZ);
+    const first = sim.stats.processed;
+    const ticks = settle(sim, world);
+    check(
+      `agua: el primer tick respeta CELL_BUDGET (${first} de ${LIQUID.CELL_BUDGET}, ${sim.stats.ms.toFixed(2)} ms) y todo se duerme en ${ticks} ticks`,
+      first === LIQUID.CELL_BUDGET && ticks <= 5,
+    );
+  }
+
+  // --- Generación ---
+  const gen = new WorldGenerator(12345);
+  let lakeBx = Number.NaN;
+  for (let bx = -800; bx < 800; bx++) {
+    if (gen.surfaceHeight(bx) >= GEN.WATER_LEVEL + 3) {
+      lakeBx = bx;
+      break;
     }
   }
-  return out;
-}
+  check(`agua: hay depresiones bajo el nivel del mar en la semilla de prueba (x = ${lakeBx})`, Number.isFinite(lakeBx));
 
-export function runPhase12Tests() {
-  // Varitas e inventario
-  check(
-    'las tres varitas lanzan arena, agua y lava como píxeles',
-    WANDS[ItemId.WAND_WATER].material === PixelMat.WATER &&
-      WANDS[ItemId.WAND_SAND].material === PixelMat.SAND &&
-      WANDS[ItemId.WAND_LAVA].material === PixelMat.LAVA,
-  );
-  {
-    const inv = new Inventory();
-    inv.add(ItemId.WAND_LAVA, 2);
-    check(
-      'las varitas no se apilan',
-      inv.slots[0]?.count === 1 && inv.slots[1]?.id === ItemId.WAND_LAVA && inv.slots[1]?.count === 1,
-    );
-    const r = new Inventory();
-    r.restore(`{"slots":[[${ItemId.WAND_WATER},1],[9,50],[99,3]],"selected":0}`);
-    check(
-      'restore acepta varitas y descarta los ids de bloques que ya no existen',
-      r.slots[0]?.id === ItemId.WAND_WATER && r.slots[1] === null && r.slots[2] === null,
-    );
-  }
-
-  // Puntería
-  {
-    const v = 340;
-    const g = 520;
-    let ok = true;
-    const targets: Array<[number, number]> = [[100, 0], [150, 30], [200, -40], [-120, 20]];
-    for (const [dx, dy] of targets) {
-      const a = aimAngle(dx, dy, v, g);
-      const t = dx / (v * Math.cos(a));
-      const y = v * Math.sin(a) * t - 0.5 * g * t * t;
-      if (!(t > 0) || Math.abs(y - dy) > 1) ok = false;
+  if (Number.isFinite(lakeBx)) {
+    const h = gen.surfaceHeight(lakeBx);
+    const mk = () => new WorldManager((ch) => gen.generateChunk(ch));
+    const cx = blockToChunkCoord(lakeBx);
+    const lx = blockToLocalCoord(lakeBx);
+    const w = mk();
+    let rule = true;
+    for (let by = GEN.WATER_LEVEL - 1; by <= h; by++) {
+      w.getOrCreateChunk(cx, blockToChunkCoord(by));
+      const expected = by >= GEN.WATER_LEVEL && by < h ? MAX : 0;
+      if (w.getLiquid(lakeBx, by) !== expected) rule = false;
     }
-    check('puntería: la parábola pasa por el objetivo (a derecha e izquierda)', ok);
-    check('puntería: fuera de alcance dispara a 45°', Math.abs(aimAngle(10000, 0, v, g) - Math.PI / 4) < 1e-9);
-    check(
-      'puntería: hacia la izquierda es el espejo de la derecha',
-      Math.abs(aimAngle(-100, 0, v, g) - (Math.PI - aimAngle(100, 0, v, g))) < 1e-9,
-    );
-  }
+    check(`agua: el lago ocupa desde WATER_LEVEL (${GEN.WATER_LEVEL}) hasta justo encima del pasto (${h})`, rule);
 
-  // Ediciones antiguas de bloques fluidos
-  {
-    const w = new WorldManager();
-    w.loadEdits(new Map([['0,1', [[5, 9], [6, BlockId.STONE]]]]));
-    w.getOrCreateChunk(0, 1);
-    check(
-      'las ediciones con ids de bloques que ya no existen se descartan al cargar',
-      w.getBlock(5, 32) === BlockId.AIR && w.getBlock(6, 32) === BlockId.STONE,
-    );
-  }
-
-  // Colisión suavizada: el mundo plano tiene el suelo en by = 64, o sea, en la celda 512
-  {
-    const { px } = pixWorld();
-    check('colisión: el suelo plano empieza exactamente en la celda 512', px.isSolidCell(40, 512) && !px.isSolidCell(40, 511));
-  }
-  {
-    const { w, px } = pixWorld();
-    w.setBlock(5, 62, BlockId.STONE);
-    check(
-      'colisión suavizada: un bloque aislado es un rombo (centro sólido, esquinas libres)',
-      px.isSolidCell(44, 500) && !px.isSolidCell(40, 496) && !px.isSolidCell(47, 503),
-    );
-  }
-
-  // Arena
-  {
-    const { px } = pixWorld();
-    px.deposit(40, 400, PixelMat.SAND);
-    stepPx(px, 80);
-    const p = findPixels(px, PixelMat.SAND);
-    check('arena: cae y se apoya en el suelo', p.length === 1 && p[0][0] === 40 && p[0][1] === 511);
-  }
-  {
-    const { px } = pixWorld(mulberry32(5));
-    for (let i = 0; i < 40; i++) {
-      px.deposit(100, 480, PixelMat.SAND);
-      stepPx(px, 4);
+    let inSolid = 0;
+    let cellsWithWater = 0;
+    for (let ccx = -3; ccx <= 3; ccx++) {
+      for (let ccy = 0; ccy <= 4; ccy++) {
+        const c = w.getOrCreateChunk(ccx, ccy);
+        for (let i = 0; i < c.liquid.length; i++) {
+          if (c.liquid[i] > 0) {
+            cellsWithWater++;
+            if (isSolidBlock(c.blocks[i])) inSolid++;
+          }
+        }
+      }
     }
-    stepPx(px, 200);
-    const p = findPixels(px, PixelMat.SAND);
-    const heights = new Map<number, number>();
-    for (const [x] of p) heights.set(x, (heights.get(x) ?? 0) + 1);
-    const maxH = Math.max(...heights.values());
+    check(`agua: ninguna celda con agua dentro de un bloque sólido (${cellsWithWater} celdas con agua)`, inSolid === 0);
+
+    // Determinismo
+    const a = new Chunk(cx, blockToChunkCoord(GEN.WATER_LEVEL));
+    const b = new Chunk(cx, blockToChunkCoord(GEN.WATER_LEVEL));
+    gen.generateChunk(a);
+    new WorldGenerator(12345).generateChunk(b);
+    check('agua: la misma semilla genera la misma agua', sameArray(a.liquid, b.liquid));
+
+    // Una columna seca no tiene agua
+    let dryBx = Number.NaN;
+    for (let bx = 0; bx < 400; bx++) if (gen.surfaceHeight(bx) <= GEN.WATER_LEVEL) { dryBx = bx; break; }
+    let dryClean = Number.isFinite(dryBx);
+    for (let ccy = 0; ccy <= 4 && dryClean; ccy++) {
+      const c = w.getOrCreateChunk(blockToChunkCoord(dryBx), ccy);
+      for (let y = 0; y < CHUNK_SIZE; y++) if (c.liquid[y * CHUNK_SIZE + blockToLocalCoord(dryBx)] !== 0) dryClean = false;
+    }
+    check('agua: una columna cuya superficie está sobre el nivel del mar no tiene agua', dryClean);
+
+    // insertGenerated acepta la capa de agua y rechaza tamaños incorrectos
+    const w2 = new WorldManager();
+    w2.setProvider(new FakeProvider());
+    w2.update(5 * CHUNK_SIZE, 5 * CHUNK_SIZE, 0); // solicita solo el chunk (5, 5)
+    w2.update(6 * CHUNK_SIZE, 5 * CHUNK_SIZE, 0); // y el (6, 5)
+    const layer = new Uint16Array(CHUNK_SIZE * CHUNK_SIZE).fill(7);
     check(
-      `arena: 40 píxeles forman un montículo (${heights.size} columnas, altura máx. ${maxH})`,
-      p.length === 40 && heights.size >= 6 && maxH <= 12,
+      'agua: insertGenerated copia la capa de agua y rechaza una de tamaño incorrecto',
+      w2.insertGenerated(5, 5, new Uint8Array(CHUNK_SIZE * CHUNK_SIZE), layer) &&
+        w2.getLiquid(5 * CHUNK_SIZE, 5 * CHUNK_SIZE) === 7 &&
+        !w2.insertGenerated(6, 5, new Uint8Array(CHUNK_SIZE * CHUNK_SIZE), new Uint16Array(3)),
     );
-  }
-  {
-    const { px } = pixWorld();
-    px.deposit(40, 511, PixelMat.WATER);
-    px.deposit(40, 510, PixelMat.SAND);
-    px.step();
+
+    // --- Persistencia (a nivel de mundo, sin IndexedDB) ---
+    const wp = mk();
+    const cy = blockToChunkCoord(GEN.WATER_LEVEL);
+    wp.getOrCreateChunk(cx, cy);
+    check('agua: un chunk con agua que no cambió no se guarda', wp.takeModifiedLiquid().length === 0);
+    wp.addLiquid(lakeBx, GEN.WATER_LEVEL, -MAX / 2);
+    const saved = wp.takeModifiedLiquid();
     check(
-      'arena: se hunde en el agua e intercambia posición',
-      px.peek(40, 511) === PixelMat.SAND && px.peek(40, 510) === PixelMat.WATER,
+      'agua: al cambiar el agua de un chunk, se marca para guardar',
+      saved.length === 1 && saved[0][0] === `${cx},${cy}` && saved[0][1][GEN.WATER_LEVEL % CHUNK_SIZE * CHUNK_SIZE + lx] === MAX / 2,
     );
+    check('agua: takeModifiedLiquid vacía la cola', wp.takeModifiedLiquid().length === 0);
+    wp.addLiquid(lakeBx, GEN.WATER_LEVEL, -100);
+    check('agua: un cambio posterior vuelve a marcar el chunk', wp.takeModifiedLiquid().length === 1);
+
+    const wd = mk();
+    wd.getOrCreateChunk(cx, cy);
+    wd.addLiquid(lakeBx, GEN.WATER_LEVEL, -MAX / 2);
+    wd.update(lakeBx + 32 * 50, h, 1);
+    wd.update(lakeBx, h, 1);
+    check('agua: el agua cambiada sobrevive a descargar y recargar el chunk', wd.getLiquid(lakeBx, GEN.WATER_LEVEL) === MAX / 2);
+
+    const wn = mk();
+    wn.loadLiquid(new Map(saved));
+    wn.getOrCreateChunk(cx, cy);
+    check('agua: se restaura en un mundo nuevo', wn.getLiquid(lakeBx, GEN.WATER_LEVEL) === MAX / 2);
+
+    // Agua guardada dentro de un bloque sólido: se descarta y se marca para guardar
+    const wb = mk();
+    wb.loadLiquid(new Map([[`${cx},${cy}`, new Uint16Array(CHUNK_SIZE * CHUNK_SIZE).fill(MAX)]]));
+    const bc = wb.getOrCreateChunk(cx, cy);
+    let bad = 0;
+    let kept = 0;
+    for (let i = 0; i < bc.liquid.length; i++) {
+      if (bc.liquid[i] > 0 && isSolidBlock(bc.blocks[i])) bad++;
+      if (bc.liquid[i] === MAX && !isSolidBlock(bc.blocks[i])) kept++;
+    }
+    check('agua: el agua guardada dentro de bloques sólidos se descarta al cargar (y se conserva la demás)', bad === 0 && kept > 0);
+    check('agua: esa limpieza queda marcada para guardar', wb.takeModifiedLiquid().some(([k]) => k === `${cx},${cy}`));
   }
 
-  // Agua: una columna se reparte por el suelo y se queda quieta
+  // --- Nadar ---
   {
-    const { px } = pixWorld(mulberry32(3));
-    for (let i = 0; i < 60; i++) px.deposit(100, 505 - i, PixelMat.WATER);
-    stepPx(px, 900);
-    const p = findPixels(px, PixelMat.WATER);
-    const heights = new Map<number, number>();
-    for (const [x] of p) heights.set(x, (heights.get(x) ?? 0) + 1);
-    const maxH = Math.max(...heights.values());
+    const pool = flatWorld();
+    for (let bx = -10; bx <= 10; bx++) for (let by = 50; by <= 63; by++) pool.addLiquid(bx, by, MAX);
+
+    // Cae al agua, se hunde despacio y descansa en el fondo
+    const p = new Player(pool);
+    p.respawn(2, 40 * BLOCK_SIZE);
+    let maxFallInWater = 0;
+    let wasSwimming = false;
+    for (let i = 0; i < 180; i++) {
+      p.update(1 / 60, IDLE);
+      if (p.swimming) {
+        wasSwimming = true;
+        maxFallInWater = Math.max(maxFallInWater, p.vy);
+      }
+    }
+    check('nadar: al caer en el agua, el jugador nada', wasSwimming && p.swimming);
     check(
-      `agua: una columna de 60 se reparte conservando el volumen (${heights.size} columnas, altura máx. ${maxH})`,
-      p.length === 60 && heights.size >= 12 && maxH <= 6,
+      `nadar: dentro del agua la caída no supera SWIM_MAX_FALL (${maxFallInWater.toFixed(0)} px/s)`,
+      maxFallInWater <= PLAYER.SWIM_MAX_FALL + 1,
     );
-    px.step();
-    check('agua: el charco queda en reposo y su capa se duerme', px.activeLayers === 0);
-  }
+    check('nadar: termina apoyado en el fondo', p.onGround && Math.abs(p.y + p.height - 64 * BLOCK_SIZE) < 0.5);
 
-  // Agua + lava
-  {
-    const { px } = pixWorld();
-    let reacted = 0;
-    px.onReact = () => {
-      reacted++;
-    };
-    px.deposit(40, 511, PixelMat.LAVA);
-    px.deposit(41, 511, PixelMat.WATER);
-    px.step();
-    check(
-      'lava + agua: se anulan entre sí',
-      px.countMaterial(PixelMat.LAVA) === 0 && px.countMaterial(PixelMat.WATER) === 0,
-    );
-    check('lava + agua: avisa de la reacción una vez', reacted === 1);
-  }
+    // Mantener saltar sube
+    const bottom = p.y;
+    let top = bottom;
+    for (let i = 0; i < 120; i++) {
+      p.update(1 / 60, JUMP);
+      top = Math.min(top, p.y);
+    }
+    check(`nadar: mantener saltar sube más de 5 bloques (${((bottom - top) / BLOCK_SIZE).toFixed(1)})`, bottom - top > 5 * BLOCK_SIZE);
+    check('nadar: no sale disparado del agua', top > (50 - 6) * BLOCK_SIZE);
 
-  // Un bloque colocado sobre un píxel lo elimina
-  {
-    const { w, px } = pixWorld();
-    px.deposit(44, 500, PixelMat.SAND);
-    w.setBlock(5, 62, BlockId.STONE);
-    px.step();
-    check('un bloque colocado sobre un píxel lo elimina', px.countMaterial(PixelMat.SAND) === 0);
-  }
-
-  // deposit, fraction y clearArea
-  {
-    const { px } = pixWorld();
-    px.deposit(40, 511, PixelMat.WATER);
-    const ok = px.deposit(40, 511, PixelMat.SAND);
-    check(
-      'deposit: si la celda está ocupada usa la libre más cercana por encima',
-      ok && px.peek(40, 510) === PixelMat.SAND && px.peek(40, 511) === PixelMat.WATER,
-    );
-  }
-  {
-    const { px } = pixWorld();
-    px.fillRect(0, 400, 15, 407, PixelMat.WATER); // rectángulo de 32 x 16 px del mundo
-    const full = px.fraction(0, 800, 32, 16, PixelMat.WATER);
-    const half = px.fraction(0, 800, 32, 32, PixelMat.WATER);
-    check(
-      'fraction mide la proporción de celdas de un material en un rectángulo',
-      Math.abs(full - 1) < 1e-9 && Math.abs(half - 0.5) < 1e-9 && px.fraction(0, 800, 32, 16, PixelMat.SAND) === 0,
-    );
-  }
-  {
-    const { px } = pixWorld();
-    px.fillRect(100, 400, 103, 403, PixelMat.SAND); // 16 celdas
-    px.deposit(600, 400, PixelMat.SAND); // lejos del área
-    const n = px.clearArea(12, 50, 2);
-    check('clearArea borra los píxeles del área y deja los demás', n === 16 && px.countMaterial(PixelMat.SAND) === 1);
-  }
-
-  // Luz de la lava: solo emite la superficie del lago
-  {
-    const { px } = pixWorld();
-    px.fillRect(64, 488, 111, 511, PixelMat.LAVA); // bloques 8..13 x 61..63
-    const spots: string[] = [];
-    const n = px.collectLava(0, 45, 24, 63, (bx, by) => spots.push(`${bx},${by}`), 40);
-    check(
-      'lava: solo emiten luz los bloques de la superficie del lago (6, no 18)',
-      n === 6 && spots.every((s) => s.endsWith(',61')),
-    );
-  }
-
-  // Reloj de la simulación
-  {
-    const { px } = pixWorld();
-    px.params.enabled = false;
-    px.update(1);
-    check('simulación desactivada: no avanza', px.ticks === 0);
-    px.params.enabled = true;
-    px.params.tickRate = 10;
-    px.update(5);
-    check('el reloj acota los ticks por frame a 3', px.ticks >= 2 && px.ticks <= 3);
-  }
-
-  // Proyectiles
-  {
-    const { w, px } = pixWorld();
-    const ps = new ProjectileSystem(px, new EnemyManager(w), () => 0.5);
-    const fired = ps.fire(WANDS[ItemId.WAND_WATER], 100, 900, 200, 900, 0.5);
-    check('varita: el ritmo de disparo se reparte por el tiempo', fired >= 22 && fired <= 24 && ps.list.length === fired);
-  }
-  {
-    const { w, px } = pixWorld();
-    const ps = new ProjectileSystem(px, new EnemyManager(w), () => 0.5);
-    ps.spawn(PixelMat.WATER, 88, 960, 0, 200, 3, 0); // celda (44, 480), cae hacia el suelo
-    for (let i = 0; i < 180 && ps.list.length > 0; i++) ps.update(1 / 60);
-    check(
-      'varita: el proyectil se convierte en un píxel en la última celda libre antes del suelo',
-      ps.list.length === 0 && px.peek(44, 511) === PixelMat.WATER,
-    );
-  }
-  {
-    const { w, px } = pixWorld();
-    const em = new EnemyManager(w);
-    const enemy = new Enemy(w, 100, 900);
-    em.enemies.push(enemy);
-    const ps = new ProjectileSystem(px, em, () => 0.5);
-    ps.spawn(PixelMat.SAND, 70, 906, 300, 0, 2, 0.6);
-    for (let i = 0; i < 30 && ps.list.length > 0; i++) ps.update(1 / 60);
-    check(
-      'varita: un proyectil con daño hiere al enemigo',
-      Math.abs(enemy.health - (SLIME.HEALTH - 0.6)) < 1e-9 && ps.list.length === 0,
-    );
-  }
-  {
-    const { w, px } = pixWorld();
-    const em = new EnemyManager(w);
-    const enemy = new Enemy(w, 100, 900);
-    em.enemies.push(enemy);
-    const ps = new ProjectileSystem(px, em, () => 0.5);
-    ps.spawn(PixelMat.WATER, 70, 906, 300, 0, 2, 0);
-    for (let i = 0; i < 30 && ps.list.length > 0; i++) ps.update(1 / 60);
-    check('varita: el agua empuja al enemigo sin herirlo', enemy.health === SLIME.HEALTH && enemy.vx > 0 && ps.list.length === 0);
-  }
-
-  // Jugador en agua y lava
-  {
-    const dry = landedPlayer(flatWorld());
-    const dryX0 = dry.x;
-    run(dry, 1, RIGHT);
-    const dryDist = dry.x - dryX0;
-
-    const { w, px } = pixWorld();
-    const wet = landedPlayer(w);
-    wet.fluids = px;
-    px.fillRect(0, 440, 300, 511, PixelMat.WATER);
-    wet.update(1 / 60, IDLE);
-    check('agua: el jugador sumergido lo detecta', wet.inWater && !wet.inLava);
-    const wetX0 = wet.x;
+    // En el agua se avanza más despacio que en seco
+    const wet = new Player(pool);
+    wet.respawn(2, 40 * BLOCK_SIZE);
+    run(wet, 3, IDLE);
+    const wx0 = wet.x;
     run(wet, 1, RIGHT);
+    const dry = landedPlayer(pool);
+    dry.respawn(30 * BLOCK_SIZE, 60 * BLOCK_SIZE);
+    run(dry, 1, IDLE);
+    const dx0 = dry.x;
+    run(dry, 1, RIGHT);
+    const wetDx = wet.x - wx0;
+    const dryDx = dry.x - dx0;
+    check(`nadar: avanza más despacio que en seco (${wetDx.toFixed(0)} px frente a ${dryDx.toFixed(0)} px)`, wetDx > 0 && wetDx < dryDx * 0.85);
+
+    // Slimes: se hunden mucho más despacio que en el aire
+    const inWater = new Enemy(pool, 0, 52 * BLOCK_SIZE);
+    const inAir = new Enemy(pool, 30 * BLOCK_SIZE, 52 * BLOCK_SIZE);
+    for (let i = 0; i < 30; i++) {
+      inWater.update(1 / 60, 0, false);
+      inAir.update(1 / 60, 0, false);
+    }
     check(
-      `agua: se avanza más despacio (${(wet.x - wetX0).toFixed(0)} px frente a ${dryDist.toFixed(0)} px en seco)`,
-      wet.x - wetX0 < dryDist * 0.8,
+      `nadar: un slime se hunde más despacio en el agua (${(inWater.y - 52 * BLOCK_SIZE).toFixed(0)} px frente a ${(inAir.y - 52 * BLOCK_SIZE).toFixed(0)} px)`,
+      inWater.y - 52 * BLOCK_SIZE < (inAir.y - 52 * BLOCK_SIZE) * 0.5,
     );
+
+    // Los enemigos no aparecen bajo el agua: todo el terreno cercano está inundado
+    const flood = flatWorld();
+    for (let bx = -64; bx < 96; bx++) for (let by = 40; by <= 63; by++) flood.addLiquid(bx, by, MAX);
+    const target = new Player(flood);
+    target.respawn(2, 60 * BLOCK_SIZE);
+    const mgr = new EnemyManager(flood);
+    for (let i = 0; i < 40; i++) mgr.update(3.1, target);
+    check('nadar: los enemigos no aparecen bajo el agua', mgr.enemies.length === 0);
   }
+
+  // --- Luz ---
   {
-    const { w, px } = pixWorld();
-    const p = landedPlayer(w);
-    p.fluids = px;
-    px.fillRect(0, 380, 300, 511, PixelMat.WATER);
-    const y0 = p.y;
-    run(p, 1, JUMP);
-    check('agua: mantener el salto hace nadar hacia arriba', p.y < y0 - 30);
-  }
-  {
-    const { w, px } = pixWorld();
-    const p = landedPlayer(w);
-    p.fluids = px;
-    px.fillRect(0, 490, 20, 511, PixelMat.LAVA);
-    const hp0 = p.health;
-    run(p, 1, IDLE);
-    check(
-      `lava: quema al jugador (≈ 30 de vida por segundo; perdió ${(hp0 - p.health).toFixed(0)})`,
-      p.inLava && p.health < hp0 - 20 && p.health > hp0 - 40,
-    );
-  }
-  {
-    const { w, px } = pixWorld();
-    const p = landedPlayer(w);
-    const em = new EnemyManager(w);
-    em.params.spawnEnabled = false;
-    em.fluids = px;
-    px.fillRect(140, 490, 170, 511, PixelMat.LAVA);
-    em.enemies.push(new Enemy(w, 300, 64 * BLOCK_SIZE - SLIME.HEIGHT));
-    em.update(1, p);
-    check('lava: quema a los enemigos hasta matarlos', em.enemies.length === 0);
+    const lit = (w: WorldManager) => {
+      const f = new LightField(12);
+      f.begin(0, 45, 24, 18);
+      f.scan((cx, cy) => w.getChunk(cx, cy));
+      f.addLight(10.5, 55.5, 8, 1);
+      return f.brightnessAt(16, 55);
+    };
+    const dryWorld = flatWorld();
+    const wetWorld = flatWorld();
+    for (let bx = 11; bx <= 15; bx++) wetWorld.addLiquid(bx, 55, MAX);
+    const a = lit(dryWorld);
+    const b = lit(wetWorld);
+    check(`luz: el agua absorbe parte de la luz que la atraviesa (${a.toFixed(2)} sin agua, ${b.toFixed(2)} con agua)`, b < a && b > 0);
   }
 }

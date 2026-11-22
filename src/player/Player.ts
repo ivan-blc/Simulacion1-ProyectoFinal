@@ -56,6 +56,9 @@ export class Player extends PhysicsBody {
     const clamped = Math.min(dt, PLAYER.MAX_DT);
     if (clamped <= 0) return;
 
+    // Enterrado en arena (por ejemplo, tras reaparecer): sale por arriba
+    if (this.sand !== null && this.overlapsSand(this.x, this.y)) this.escapeSolids();
+
     if (this.invuln > 0) this.invuln = Math.max(0, this.invuln - clamped);
         
     // Agua y lava de píxeles: se miden una vez por frame sobre todo el cuerpo

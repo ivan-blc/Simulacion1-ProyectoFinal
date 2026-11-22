@@ -9,6 +9,8 @@ export const ItemId = {
   WAND_WATER: 101,
   WAND_SAND: 102,
   WAND_LAVA: 103,
+  WAND_OIL: 104,
+  WAND_SMOKE: 105,
 } as const;
 
 export interface WandInfo {
@@ -30,6 +32,8 @@ export const WANDS: Record<number, WandInfo> = {
   [ItemId.WAND_WATER]: { material: PixelMat.WATER, rate: 220, speed: 330, spread: 0.16, life: 1.6, damage: 0 },
   [ItemId.WAND_SAND]: { material: PixelMat.SAND, rate: 170, speed: 340, spread: 0.2, life: 1.6, damage: 0.6 },
   [ItemId.WAND_LAVA]: { material: PixelMat.LAVA, rate: 90, speed: 320, spread: 0.12, life: 1.6, damage: 1.6 },
+  [ItemId.WAND_OIL]: { material: PixelMat.OIL, rate: 160, speed: 320, spread: 0.16, life: 1.6, damage: 0 },
+  [ItemId.WAND_SMOKE]: { material: PixelMat.SMOKE, rate: 130, speed: 230, spread: 0.45, life: 1.0, damage: 0 },
 };
 
 export interface ItemInfo {
@@ -43,6 +47,8 @@ const WAND_INFO: Record<number, ItemInfo> = {
   [ItemId.WAND_WATER]: { name: 'varita de agua', color: '#3b8cff', glyph: '✦' },
   [ItemId.WAND_SAND]: { name: 'varita de arena', color: '#d8b84e', glyph: '✦' },
   [ItemId.WAND_LAVA]: { name: 'varita de lava', color: '#ff5a1a', glyph: '✦' },
+  [ItemId.WAND_OIL]: { name: 'varita de aceite', color: '#c4a030', glyph: '✦' },
+  [ItemId.WAND_SMOKE]: { name: 'varita de humo', color: '#9a9590', glyph: '✦' },
 };
 
 export function isWand(id: number): boolean {

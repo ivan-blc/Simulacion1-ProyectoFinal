@@ -46,6 +46,7 @@ const LIGHT_SCALE = 2; // muestras de luz por bloque y eje
 const ENEMY_LIGHT_OPACITY = 0.6; // fracción de luz que absorbe un enemigo
 const STARTING_TORCHES = 20;
 const STARTING_WANDS = [ItemId.WAND_WATER, ItemId.WAND_SAND, ItemId.WAND_LAVA];
+const NEW_WANDS = [ItemId.WAND_OIL, ItemId.WAND_SMOKE];
 
 const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -145,12 +146,14 @@ async function main() {
   const invKey = `terraria-pixi-inv-${seed}`;
   const giftKey = `terraria-pixi-torches-${seed}`;
   const wandKey = `terraria-pixi-wands-${seed}`;
+  const wand2Key = `terraria-pixi-wands2-${seed}`;
   const inventory = new Inventory();
   try {
     if (reset) {
       localStorage.removeItem(invKey);
       localStorage.removeItem(giftKey);
       localStorage.removeItem(wandKey);
+      localStorage.removeItem(wand2Key);
     } else {
       const raw = localStorage.getItem(invKey);
       if (raw) inventory.restore(raw);
@@ -198,6 +201,22 @@ async function main() {
         ui.showMessage('Recibiste 3 varitas: elige una en la barra y mantén el clic izquierdo para lanzar');
       } else {
         ui.showMessage('Libera 3 espacios de la barra para recibir las varitas');
+      }
+    }
+  } catch {
+    /* sin localStorage no hay regalo */
+  }
+
+  // Regalo de las varitas de aceite y humo: una sola vez por mundo, y solo si caben las dos
+  try {
+    if (!localStorage.getItem(wand2Key)) {
+      const free = inventory.slots.filter((s) => s === null).length;
+      if (free >= NEW_WANDS.length) {
+        for (const id of NEW_WANDS) inventory.add(id);
+        localStorage.setItem(wand2Key, '1');
+        ui.showMessage('Recibiste 2 varitas nuevas: aceite y humo');
+      } else {
+        ui.showMessage('Libera 2 espacios de la barra para recibir las varitas de aceite y humo');
       }
     }
   } catch {
@@ -320,6 +339,7 @@ async function main() {
   // El agua y la lava de píxeles afectan al jugador y a los enemigos
   player.fluids = pixels;
   enemies.fluids = pixels;
+  player.sand = pixels; // la arena es sólida para el jugador
 
   // Agua + lava: se anulan con vapor y un siseo (las partículas se limitan para no saturar)
   let lastSteam = 0;
@@ -603,7 +623,7 @@ async function main() {
               // Solo bloques que se pueden tener como ítem (sin aire, ni líquidos, ni pasto)
               if (id !== BlockId.AIR && dropFor(id) === id) inventory.add(id, 99);
             }
-            for (const id of STARTING_WANDS) {
+            for (const id of [...STARTING_WANDS, ...NEW_WANDS]) {
               if (inventory.count(id) === 0 && inventory.canAdd(id)) inventory.add(id);
             }
           },
@@ -663,6 +683,8 @@ async function main() {
       camera.y += (player.y + player.height / 2 - camera.y) * k;
     }
 
+    // La arena no puede entrar en la caja del jugador: se apoya encima
+    pixels.setReservedBox(player.x, player.y, player.width, player.height);
     // Arena, agua y lava, y proyectiles de las varitas
     pixels.update(dt);
     projectiles.update(dt);

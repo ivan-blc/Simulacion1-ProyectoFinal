@@ -3,8 +3,42 @@ import { CHUNK_SIZE } from '../core/constants';
 import { CASES, PX, PY } from '../render/smoothing';
 import type { Chunk } from '../world/Chunk';
 import type { WorldManager } from '../world/WorldManager';
-import { CELL_PX, CHUNK_MASK, CHUNK_PIX, CHUNK_SHIFT, HALF, PPB, PixelMat } from './materials';
-import type { FluidSensor } from './materials';
+import {
+  CELL_PX,
+  CHUNK_MASK,
+  CHUNK_PIX,
+  CHUNK_SHIFT,
+  HALF,
+  HEAT_MASK,
+  PPB,
+  PixelMat,
+  TONES,
+  TONE_SHIFT,
+} from './materials';
+import type { FluidSensor, SandSensor } from './materials';
+
+/** Reglas que se pueden activar y desactivar en vivo (las mismas del archivo de referencia). */
+export interface SimRules {
+  sandFall: boolean;
+  sandSink: boolean;
+  /** ON = el fluido salta a un hueco lateral (olas); OFF = intercambia posición con la arena (SWAP). */
+  sandSplash: boolean;
+  sandDiagonal: boolean;
+  /** Reglas del agua y de la lava. */
+  waterFall: boolean;
+  waterDiagonal: boolean;
+  /** Flujo horizontal aleatorio de una celda (solo el agua; la lava es más viscosa). */
+  waterFlow: boolean;
+  /** Reglas del aceite. */
+  oilFall: boolean;
+  oilDiagonal: boolean;
+  oilFlow: boolean;
+  /** Reglas del humo. */
+  smokeRise: boolean;
+  smokeDiagonal: boolean;
+  smokeDisperse: boolean;
+  smokeFade: boolean;
+}
 
 export interface SimParams {
   enabled: boolean;
@@ -12,11 +46,18 @@ export interface SimParams {
   tickRate: number;
   /** Celdas que cae un píxel por tick. */
   fallCells: number;
-  /** Celdas que mira el agua en horizontal buscando un desnivel. */
+  /** Celdas que mira el agua (y el aceite) en horizontal buscando un desnivel. */
   waterReach: number;
   lavaReach: number;
   /** La lava se mueve cada N ticks (1..4): a mayor valor, más viscosa. */
   lavaEvery: number;
+  /** Pasos de flujo horizontal aleatorio que da una gota tras caer, ser desplazada o lanzada (0..31). */
+  flowHeat: number;
+  /** Densidad del aceite respecto al agua (1). <1 flota, >1 se hunde, =1 no se intercambian. */
+  oilDensity: number;
+  /** Persistencia del humo: vida media en segundos. Más alta = tarda más en desaparecer. */
+  smokeLife: number;
+  rules: SimRules;
 }
 
 export const DEFAULT_SIM_PARAMS: SimParams = {
@@ -26,17 +67,53 @@ export const DEFAULT_SIM_PARAMS: SimParams = {
   waterReach: 12,
   lavaReach: 3,
   lavaEvery: 2,
+  flowHeat: 16,
+  oilDensity: 0.8,
+  smokeLife: 1.7,
+  rules: {
+    sandFall: true,
+    sandSink: true,
+    sandSplash: true,
+    sandDiagonal: true,
+    waterFall: true,
+    waterDiagonal: true,
+    waterFlow: true,
+    oilFall: true,
+    oilDiagonal: true,
+    oilFlow: true,
+    smokeRise: true,
+    smokeDiagonal: true,
+    smokeDisperse: true,
+    smokeFade: true,
+  },
 };
+
+export function cloneSimParams(p: SimParams = DEFAULT_SIM_PARAMS): SimParams {
+  return { ...p, rules: { ...p.rules } };
+}
 
 const CELLS = CHUNK_PIX * CHUNK_PIX;
 /** Valor que devuelve probe() para terreno sólido o chunk sin cargar. */
 const SOLID = 255;
-const SINK_CHANCE = 0.6; // probabilidad por tick de hundirse un nivel en un líquido
 const REACT_CHANCE = 0.5; // probabilidad por tick de que agua y lava en contacto se anulen
+const BUOYANCY_GAIN = 1.5; // probabilidad de intercambio = |densidad - 1| * ganancia (acotada a 1)
 const SLEEP_TICKS = 6; // ticks sin movimiento antes de dormir (debe ser > lavaEvery máximo)
 const MAX_TICKS_PER_UPDATE = 3;
 const LAVA_LIGHT_MIN = 6; // celdas de lava (de 64) para que un bloque emita luz
 const LAVA_REFRESH_TICKS = 8;
+
+/**
+ * Candidatos del splash, en el orden del archivo de referencia, relativos a la celda del fluido:
+ * costados, arriba-costados, costados lejanos, arriba-costados lejanos y abajo-costados.
+ * Cada uno se prueba a izquierda y a derecha (en orden aleatorio).
+ */
+const SPLASH_OFFSETS: ReadonlyArray<readonly [number, number]> = [
+  [1, 0],
+  [1, -1],
+  [2, 0],
+  [2, -1],
+  [1, 1],
+];
 
 const ckey = (cx: number, cy: number): number => (cx + 32768) * 65536 + (cy + 32768);
 
@@ -79,10 +156,13 @@ export class PixelLayer {
   readonly cx: number;
   readonly cy: number;
   readonly cells = new Uint8Array(CELLS);
+  /** Por celda: bits 0-4 = agitación, bits 5-6 = tono de color. Viaja con la partícula. */
+  readonly meta = new Uint8Array(CELLS);
   /** Marca de tick en que se movió cada celda (evita mover dos veces el mismo píxel en un tick). */
   readonly moved = new Uint8Array(CELLS);
   count = 0;
   lavaCount = 0;
+  sandCount = 0;
   sleep = false;
   idle = 0;
   renderDirty = true;
@@ -103,8 +183,8 @@ export class PixelLayer {
   }
 }
 
-export class PixelSim implements FluidSensor {
-  readonly params: SimParams = { ...DEFAULT_SIM_PARAMS };
+export class PixelSim implements FluidSensor, SandSensor {
+  readonly params: SimParams = cloneSimParams();
   readonly layers = new Map<number, PixelLayer>();
   /** Máximo de capas en memoria; las de chunks descargados se descartan al superarlo. */
   maxLayers = 96;
@@ -126,6 +206,16 @@ export class PixelSim implements FluidSensor {
   private acc = 0;
   private stamp = 0;
   private reacted = false;
+  private splashX = 0;
+  private splashY = 0;
+  private sandTotal = 0;
+  private lastSig = '';
+
+  // Caja reservada por el jugador (en celdas): la arena no puede entrar en ella. Vacía por defecto.
+  private rx0 = 1;
+  private rx1 = 0;
+  private ry0 = 1;
+  private ry1 = 0;
 
   // Caché de la última capa y mapa de colisión consultados
   private pcx = Number.NaN;
@@ -165,6 +255,16 @@ export class PixelSim implements FluidSensor {
     this.resetProbe();
     this.reacted = false;
 
+    // Si cambió un parámetro o una regla, las capas dormidas pueden tener algo que hacer
+    const sig = this.signature();
+    if (sig !== this.lastSig) {
+      this.lastSig = sig;
+      for (const l of this.layers.values()) {
+        l.sleep = false;
+        l.idle = 0;
+      }
+    }
+
     const ltr = (this.ticks & 1) === 0;
     const work: PixelLayer[] = [];
     for (const l of this.layers.values()) {
@@ -188,6 +288,11 @@ export class PixelSim implements FluidSensor {
     this.moves = total;
     this.evict();
     this.tickMs = performance.now() - t0;
+  }
+
+  private signature(): string {
+    const p = this.params;
+    return `${p.oilDensity}|${p.smokeLife}|${p.flowHeat}|${p.waterReach}|${p.lavaReach}|${p.lavaEvery}|${p.fallCells}|${Object.values(p.rules).join('')}`;
   }
 
   // ------------------------------------------------------------ eventos del mundo
@@ -222,6 +327,7 @@ export class PixelSim implements FluidSensor {
   clearAll(): void {
     this.layers.clear();
     this.colls.clear();
+    this.sandTotal = 0;
     this.resetProbe();
   }
 
@@ -233,10 +339,43 @@ export class PixelSim implements FluidSensor {
     return l ? l.cells[((y & CHUNK_MASK) << CHUNK_SHIFT) | (x & CHUNK_MASK)] : 0;
   }
 
+  /** Tono de color (0..3) de la partícula de la celda (x, y). */
+  peekTone(x: number, y: number): number {
+    return (this.metaAt(x, y) >> TONE_SHIFT) & (TONES - 1);
+  }
+
   /** ¿Es sólida la celda según el terreno suavizado? Un chunk sin cargar cuenta como sólido. */
   isSolidCell(x: number, y: number): boolean {
     this.resetProbe();
     return this.probe(x, y) === SOLID;
+  }
+
+  /** ¿Hay alguna celda de arena dentro del rectángulo (px del mundo)? Los cuerpos con colisión de arena la usan. */
+  overlapsSand(x: number, y: number, w: number, h: number): boolean {
+    if (this.sandTotal === 0) return false;
+    const x0 = Math.floor(x / CELL_PX);
+    const x1 = Math.floor((x + w - 0.001) / CELL_PX);
+    const y0 = Math.floor(y / CELL_PX);
+    const y1 = Math.floor((y + h - 0.001) / CELL_PX);
+    for (let py = y0; py <= y1; py++) {
+      for (let px = x0; px <= x1; px++) if (this.peek(px, py) === PixelMat.SAND) return true;
+    }
+    return false;
+  }
+
+  /** Reserva un rectángulo (px del mundo) para el jugador: la arena no puede entrar en él, se apoya encima. */
+  setReservedBox(x: number, y: number, w: number, h: number): void {
+    this.rx0 = Math.floor(x / CELL_PX);
+    this.rx1 = Math.floor((x + w - 0.001) / CELL_PX);
+    this.ry0 = Math.floor(y / CELL_PX);
+    this.ry1 = Math.floor((y + h - 0.001) / CELL_PX);
+  }
+
+  clearReservedBox(): void {
+    this.rx0 = 1;
+    this.rx1 = 0;
+    this.ry0 = 1;
+    this.ry1 = 0;
   }
 
   /**
@@ -246,14 +385,14 @@ export class PixelSim implements FluidSensor {
   deposit(x: number, y: number, mat: number): boolean {
     this.resetProbe();
     for (let dy = 0; dy <= 6; dy++) {
-      if (this.probe(x, y - dy) === 0) {
-        this.write(x, y - dy, mat);
+      if (this.isFree(mat, x, y - dy)) {
+        this.write(x, y - dy, mat, false, this.newMeta(mat));
         return true;
       }
     }
     for (const dx of [-1, 1, -2, 2]) {
-      if (this.probe(x + dx, y) === 0) {
-        this.write(x + dx, y, mat);
+      if (this.isFree(mat, x + dx, y)) {
+        this.write(x + dx, y, mat, false, this.newMeta(mat));
         return true;
       }
     }
@@ -266,8 +405,8 @@ export class PixelSim implements FluidSensor {
     let n = 0;
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
-        if (this.probe(x, y) === 0) {
-          this.write(x, y, mat);
+        if (this.isFree(mat, x, y)) {
+          this.write(x, y, mat, false, this.newMeta(mat));
           n++;
         }
       }
@@ -443,7 +582,7 @@ export class PixelSim implements FluidSensor {
     }
   }
 
-  /** 0 = libre, SOLID = terreno (o chunk sin cargar), 1..3 = material que ocupa la celda. */
+  /** 0 = libre, SOLID = terreno (o chunk sin cargar), 1..5 = material que ocupa la celda. */
   private probe(x: number, y: number): number {
     const cx = x >> CHUNK_SHIFT;
     const cy = y >> CHUNK_SHIFT;
@@ -459,8 +598,45 @@ export class PixelSim implements FluidSensor {
     return this.pLayer ? this.pLayer.cells[i] : 0;
   }
 
-  /** Escribe una celda, creando la capa si hace falta y llevando las cuentas. `mark` la marca como movida en este tick. */
-  private write(x: number, y: number, v: number, mark = false): void {
+  private reserved(x: number, y: number): boolean {
+    return x >= this.rx0 && x <= this.rx1 && y >= this.ry0 && y <= this.ry1;
+  }
+
+  /** Como probe(), pero la caja reservada del jugador cuenta como sólida (solo para la arena). */
+  private sandProbe(x: number, y: number): number {
+    return this.reserved(x, y) ? SOLID : this.probe(x, y);
+  }
+
+  /** ¿Puede el material ocupar la celda? La arena además respeta la caja del jugador. */
+  private isFree(mat: number, x: number, y: number): boolean {
+    return this.probe(x, y) === 0 && !(mat === PixelMat.SAND && this.reserved(x, y));
+  }
+
+  /** `meta` de la celda (x, y): agitación y tono. */
+  private metaAt(x: number, y: number): number {
+    const l = this.layers.get(ckey(x >> CHUNK_SHIFT, y >> CHUNK_SHIFT));
+    return l ? l.meta[((y & CHUNK_MASK) << CHUNK_SHIFT) | (x & CHUNK_MASK)] : 0;
+  }
+
+  /** Agitación con la que nace o se mueve una partícula: el agua y el aceite la tienen; el humo, el doble (un gas se dispersa más). */
+  private heatFor(mat: number): number {
+    const base = Math.max(0, Math.min(HEAT_MASK, Math.round(this.params.flowHeat)));
+    if (mat === PixelMat.WATER || mat === PixelMat.OIL) return base;
+    if (mat === PixelMat.SMOKE) return Math.min(HEAT_MASK, base * 2);
+    return 0;
+  }
+
+  /** `meta` de una partícula nueva: un tono al azar y la agitación inicial. */
+  private newMeta(mat: number): number {
+    const tone = Math.min(TONES - 1, Math.floor(this.rand() * TONES));
+    return (tone << TONE_SHIFT) | this.heatFor(mat);
+  }
+
+  /**
+   * Escribe una celda, creando la capa si hace falta y llevando las cuentas.
+   * `mark` la marca como movida en este tick; `meta` es su agitación y su tono.
+   */
+  private write(x: number, y: number, v: number, mark = false, meta = 0): void {
     const cx = x >> CHUNK_SHIFT;
     const cy = y >> CHUNK_SHIFT;
     let l = this.layers.get(ckey(cx, cy));
@@ -474,17 +650,31 @@ export class PixelSim implements FluidSensor {
     const ly = y & CHUNK_MASK;
     const i = (ly << CHUNK_SHIFT) | lx;
     const old = l.cells[i];
+    const m = v === 0 ? 0 : meta;
     if (old === v) {
+      if (l.meta[i] !== m) {
+        l.meta[i] = m;
+        l.renderDirty = true; // cambió el tono
+      }
       if (mark) l.moved[i] = this.stamp;
       return;
     }
     l.cells[i] = v;
+    l.meta[i] = m;
     l.version++;
     l.renderDirty = true;
     if (old === 0) l.count++;
     else if (v === 0) l.count--;
     if (old === PixelMat.LAVA) l.lavaCount--;
     if (v === PixelMat.LAVA) l.lavaCount++;
+    if (old === PixelMat.SAND) {
+      l.sandCount--;
+      this.sandTotal--;
+    }
+    if (v === PixelMat.SAND) {
+      l.sandCount++;
+      this.sandTotal++;
+    }
     if (v !== 0) {
       if (lx < l.minX) l.minX = lx;
       if (lx > l.maxX) l.maxX = lx;
@@ -496,8 +686,10 @@ export class PixelSim implements FluidSensor {
     }
   }
 
-  private move(fx: number, fy: number, tx: number, ty: number, v: number): void {
-    this.write(tx, ty, v, true);
+  /** Mueve una partícula: el tono viaja con ella y la agitación se fija en `heat`. */
+  private move(fx: number, fy: number, tx: number, ty: number, v: number, heat: number): void {
+    const tone = this.metaAt(fx, fy) >> TONE_SHIFT;
+    this.write(tx, ty, v, true, (tone << TONE_SHIFT) | heat);
     this.write(fx, fy, 0);
   }
 
@@ -519,7 +711,10 @@ export class PixelSim implements FluidSensor {
     if (this.layers.size > this.maxLayers) {
       for (const [k, l] of this.layers) {
         if (this.layers.size <= this.maxLayers) break;
-        if (!this.world.getChunk(l.cx, l.cy)) this.layers.delete(k);
+        if (!this.world.getChunk(l.cx, l.cy)) {
+          this.sandTotal -= l.sandCount;
+          this.layers.delete(k);
+        }
       }
     }
     this.resetProbe();
@@ -595,70 +790,163 @@ export class PixelSim implements FluidSensor {
         if (moved[i] === stamp) continue; // ya se movió en este tick
         if (m === PixelMat.LAVA && !lavaTurn) continue;
 
-        const moving =
-          m === PixelMat.SAND ? this.stepSand(x0 + lx, y0 + ly) : this.stepLiquid(x0 + lx, y0 + ly, m);
+        let moving: boolean;
+        if (m === PixelMat.SAND) moving = this.stepSand(x0 + lx, y0 + ly);
+        else if (m === PixelMat.SMOKE) moving = this.stepSmoke(x0 + lx, y0 + ly);
+        else moving = this.stepLiquid(x0 + lx, y0 + ly, m);
         if (moving) active++;
       }
     }
     return active;
   }
 
-  private fallDistance(x: number, y: number): number {
+  private fallDistance(x: number, y: number, mat: number): number {
     // Llamar con la celda (x, y + 1) ya comprobada como libre: devuelve hasta dónde cae
     const fall = Math.max(1, Math.round(this.params.fallCells));
     let ny = y + 1;
-    for (let k = 1; k < fall && this.probe(x, ny + 1) === 0; k++) ny++;
+    for (let k = 1; k < fall && this.isFree(mat, x, ny + 1); k++) ny++;
     return ny;
   }
 
+  // ------------------------------------------------------------ arena
+
   private stepSand(x: number, y: number): boolean {
-    const below = this.probe(x, y + 1);
-    if (below === 0) {
-      this.move(x, y, x, this.fallDistance(x, y), PixelMat.SAND);
+    const r = this.params.rules;
+    const below = this.sandProbe(x, y + 1);
+
+    if (r.sandFall && below === 0) {
+      this.move(x, y, x, this.fallDistance(x, y, PixelMat.SAND), PixelMat.SAND, 0);
       return true;
     }
-    if (below === PixelMat.WATER || below === PixelMat.LAVA) {
-      // La arena es más densa: se hunde intercambiando posición con el líquido
-      if (this.rand() < SINK_CHANCE) {
-        this.write(x, y + 1, PixelMat.SAND, true);
-        this.write(x, y, below, true);
-      }
+
+    // Es más densa que los líquidos: se hunde, y el fluido se aparta a un costado (splash) o intercambia posición
+    if (r.sandSink && (below === PixelMat.WATER || below === PixelMat.LAVA || below === PixelMat.OIL)) {
+      this.sinkIntoFluid(x, y, below);
       return true;
     }
-    // Resbala en diagonal si tanto el hueco de al lado como el de debajo están libres
-    const first = this.rand() < 0.5 ? -1 : 1;
-    for (let k = 0; k < 2; k++) {
-      const d = k === 0 ? first : -first;
-      if (this.probe(x + d, y) === 0 && this.probe(x + d, y + 1) === 0) {
-        this.move(x, y, x + d, y + 1, PixelMat.SAND);
-        return true;
+
+    // Diagonal: como en el archivo de referencia, solo hace falta que la celda destino esté libre
+    if (r.sandDiagonal) {
+      const first = this.rand() < 0.5 ? -1 : 1;
+      for (let k = 0; k < 2; k++) {
+        const d = k === 0 ? first : -first;
+        if (this.sandProbe(x + d, y + 1) === 0) {
+          this.move(x, y, x + d, y + 1, PixelMat.SAND, 0);
+          return true;
+        }
       }
     }
     return false;
   }
 
-  private stepLiquid(x: number, y: number, mat: number): boolean {
-    if (this.reactNeighbors(x, y, mat)) return true;
-    if (this.probe(x, y + 1) === 0) {
-      this.move(x, y, x, this.fallDistance(x, y), mat);
-      return true;
+  /**
+   * La arena ocupa la celda del fluido de debajo. Con splash, el fluido salta a un hueco cercano (el sitio de
+   * la arena queda vacío: el fluido no sube por el chorro). Sin hueco, o con el splash apagado, se intercambian (SWAP).
+   */
+  private sinkIntoFluid(x: number, y: number, fluidMat: number): void {
+    const fx = x;
+    const fy = y + 1;
+    const fluidTone = this.metaAt(fx, fy) >> TONE_SHIFT;
+    const sandTone = this.metaAt(x, y) >> TONE_SHIFT;
+    const fluidMeta = (fluidTone << TONE_SHIFT) | this.heatFor(fluidMat); // el fluido desplazado queda agitado
+
+    if (this.params.rules.sandSplash && this.findSplashEmpty(fx, fy)) {
+      this.write(this.splashX, this.splashY, fluidMat, true, fluidMeta); // el fluido va al costado (ola)
+      this.write(fx, fy, PixelMat.SAND, true, sandTone << TONE_SHIFT); // la arena ocupa donde estaba el fluido
+      this.write(x, y, 0); // arriba queda vacío
+      return;
     }
-    const first = this.rand() < 0.5 ? -1 : 1;
-    for (let k = 0; k < 2; k++) {
-      const d = k === 0 ? first : -first;
-      if (this.probe(x + d, y) === 0 && this.probe(x + d, y + 1) === 0) {
-        this.move(x, y, x + d, y + 1, mat);
-        return true;
+
+    this.write(fx, fy, PixelMat.SAND, true, sandTone << TONE_SHIFT);
+    this.write(x, y, fluidMat, false, fluidMeta); // sin marca: puede fluir después
+  }
+
+  /** Busca un hueco cerca de la celda del fluido (wx, wy) para empujar «volumen» a los costados. Deja el resultado en splashX/Y. */
+  private findSplashEmpty(wx: number, wy: number): boolean {
+    const flip = this.rand() < 0.5 ? -1 : 1;
+    for (const [ox, oy] of SPLASH_OFFSETS) {
+      for (let k = 0; k < 2; k++) {
+        const dir = k === 0 ? flip : -flip;
+        const nx = wx + ox * dir;
+        const ny = wy + oy;
+        if (this.probe(nx, ny) === 0) {
+          this.splashX = nx;
+          this.splashY = ny;
+          return true;
+        }
       }
     }
+    return false;
+  }
+
+  // ------------------------------------------------------------ agua, aceite y lava
+
+  private stepLiquid(x: number, y: number, mat: number): boolean {
+    if (this.reactNeighbors(x, y, mat)) return true;
+    const r = this.params.rules;
+    const heat = this.heatFor(mat);
+    const oil = mat === PixelMat.OIL;
+    const fall = oil ? r.oilFall : r.waterFall;
+    const diagonal = oil ? r.oilDiagonal : r.waterDiagonal;
+    const flow = mat === PixelMat.WATER ? r.waterFlow : oil ? r.oilFlow : false;
+
+    const below = this.probe(x, y + 1);
+    if (fall && below === 0) {
+      this.move(x, y, x, this.fallDistance(x, y, mat), mat, heat);
+      return true;
+    }
+
+    // Densidad: el más denso de agua y aceite se hunde. Mientras haya diferencia, la celda sigue «viva» aunque aún no se intercambie
+    let swapChance = 0;
+    if (mat === PixelMat.WATER && below === PixelMat.OIL) swapChance = Math.max(0, 1 - this.params.oilDensity);
+    else if (oil && below === PixelMat.WATER) swapChance = Math.max(0, this.params.oilDensity - 1);
+    if (swapChance > 0) {
+      if (this.rand() < Math.min(1, swapChance * BUOYANCY_GAIN)) this.swapVertical(x, y, mat, below);
+      return true;
+    }
+
+    if (diagonal) {
+      const first = this.rand() < 0.5 ? -1 : 1;
+      for (let k = 0; k < 2; k++) {
+        const d = k === 0 ? first : -first;
+        if (this.probe(x + d, y + 1) === 0) {
+          this.move(x, y, x + d, y + 1, mat, heat);
+          return true;
+        }
+      }
+    }
+
+    // Flujo horizontal aleatorio de una celda. Cada paso gasta agitación: así termina y la capa puede dormirse
+    if (flow) {
+      const left = this.metaAt(x, y) & HEAT_MASK;
+      if (left > 0) {
+        const first = this.rand() < 0.5 ? -1 : 1;
+        for (let k = 0; k < 2; k++) {
+          const d = k === 0 ? first : -first;
+          if (this.probe(x + d, y) === 0) {
+            this.move(x, y, x + d, y, mat, left - 1);
+            return true;
+          }
+        }
+      }
+    }
+
     const reach = Math.max(1, Math.round(mat === PixelMat.LAVA ? this.params.lavaReach : this.params.waterReach));
     return this.spread(x, y, mat, reach);
   }
 
+  /** La celda (x, y) (`upMat`) baja y la de debajo (`downMat`) sube. Cada una conserva su tono. */
+  private swapVertical(x: number, y: number, upMat: number, downMat: number): void {
+    const upTone = this.metaAt(x, y) >> TONE_SHIFT;
+    const downTone = this.metaAt(x, y + 1) >> TONE_SHIFT;
+    this.write(x, y + 1, upMat, true, (upTone << TONE_SHIFT) | this.heatFor(upMat));
+    this.write(x, y, downMat, true, (downTone << TONE_SHIFT) | this.heatFor(downMat));
+  }
+
   /**
    * Busca por la fila el desnivel más cercano (una celda libre con hueco debajo) hasta `reach` celdas y va hacia él.
-   * Solo se mueve hacia un desnivel: cada movimiento baja la energía del conjunto, así que el líquido siempre se
-   * detiene (y la capa se duerme), y la superficie queda plana con una pendiente máxima de 1 celda por `reach`.
+   * Solo se mueve hacia un desnivel: cada movimiento acaba en una caída, así que el líquido siempre se detiene
+   * (y la capa se duerme), y la superficie queda plana con una pendiente máxima de 1 celda por `reach`.
    */
   private spread(x: number, y: number, mat: number, reach: number): boolean {
     const first = this.rand() < 0.5 ? -1 : 1;
@@ -676,13 +964,14 @@ export class PixelSim implements FluidSensor {
       }
     }
     if (bestDir === 0) return false;
-    this.move(x, y, x + bestDir * bestK, y, mat); // llega al borde del desnivel y cae en el siguiente tick
+    // Llega al borde del desnivel y cae en el siguiente tick; conserva su agitación
+    this.move(x, y, x + bestDir * bestK, y, mat, this.metaAt(x, y) & HEAT_MASK);
     return true;
   }
 
-  /** Agua junto a lava: se anulan. */
+  /** Agua junto a lava: se anulan. Solo esos dos materiales reaccionan. */
   private reactNeighbors(x: number, y: number, mat: number): boolean {
-    if (mat === PixelMat.SAND) return false;
+    if (mat !== PixelMat.WATER && mat !== PixelMat.LAVA) return false;
     const other = mat === PixelMat.LAVA ? PixelMat.WATER : PixelMat.LAVA;
     const dxs = [0, 0, -1, 1];
     const dys = [1, -1, 0, 0];
@@ -698,5 +987,55 @@ export class PixelSim implements FluidSensor {
       return true;
     }
     return false;
+  }
+
+  // ------------------------------------------------------------ humo
+
+  /** Probabilidad por tick de que una partícula de humo se disipe: 1 / (vida media × ticks por segundo). */
+  private smokeFadeChance(): number {
+    return 1 / Math.max(1, this.params.smokeLife * Math.max(1, this.params.tickRate));
+  }
+
+  /** Gas: gravedad invertida, dispersión y disipación probabilística (las reglas del archivo de referencia). */
+  private stepSmoke(x: number, y: number): boolean {
+    const r = this.params.rules;
+    if (r.smokeFade && this.rand() < this.smokeFadeChance()) {
+      this.write(x, y, 0);
+      return true;
+    }
+    const heat = this.heatFor(PixelMat.SMOKE);
+
+    if (r.smokeRise && this.probe(x, y - 1) === 0) {
+      this.move(x, y, x, y - 1, PixelMat.SMOKE, heat);
+      return true;
+    }
+
+    if (r.smokeDiagonal) {
+      const first = this.rand() < 0.5 ? -1 : 1;
+      for (let k = 0; k < 2; k++) {
+        const d = k === 0 ? first : -first;
+        if (this.probe(x + d, y - 1) === 0) {
+          this.move(x, y, x + d, y - 1, PixelMat.SMOKE, heat);
+          return true;
+        }
+      }
+    }
+
+    if (r.smokeDisperse) {
+      const left = this.metaAt(x, y) & HEAT_MASK;
+      if (left > 0) {
+        const first = this.rand() < 0.5 ? -1 : 1;
+        for (let k = 0; k < 2; k++) {
+          const d = k === 0 ? first : -first;
+          if (this.probe(x + d, y) === 0) {
+            this.move(x, y, x + d, y, PixelMat.SMOKE, left - 1);
+            return true;
+          }
+        }
+      }
+    }
+
+    // Mientras se disipa, la celda sigue «viva»: puede desaparecer en cualquier tick
+    return r.smokeFade;
   }
 }

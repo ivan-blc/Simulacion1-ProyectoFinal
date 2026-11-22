@@ -14,17 +14,30 @@ if (1 << CHUNK_SHIFT !== CHUNK_PIX) {
   throw new Error('CHUNK_SHIFT no coincide con CHUNK_PIX: si cambias PPB, ajusta también CHUNK_SHIFT');
 }
 
-export const PixelMat = { EMPTY: 0, SAND: 1, WATER: 2, LAVA: 3 } as const;
+export const PixelMat = { EMPTY: 0, SAND: 1, WATER: 2, LAVA: 3, OIL: 4, SMOKE: 5 } as const;
 export type PixelMat = (typeof PixelMat)[keyof typeof PixelMat];
 
 export const PIXEL_INFO: Record<number, { name: string; color: number }> = {
-  [PixelMat.SAND]: { name: 'arena', color: 0xdcc47a },
-  [PixelMat.WATER]: { name: 'agua', color: 0x2e78dc },
+  [PixelMat.SAND]: { name: 'arena', color: 0xdeb26c },
+  [PixelMat.WATER]: { name: 'agua', color: 0x3a7ac4 },
   [PixelMat.LAVA]: { name: 'lava', color: 0xff6a1a },
+  [PixelMat.OIL]: { name: 'aceite', color: 0xc4a030 },
+  [PixelMat.SMOKE]: { name: 'humo', color: 0x8c8884 },
 };
 
 /** Mide cuánta agua o lava hay dentro de un rectángulo (en píxeles del mundo). */
 export interface FluidSensor {
   /** Fracción (0..1) de las celdas del rectángulo que contienen este material. */
   fraction(x: number, y: number, w: number, h: number, mat: number): number;
+}
+
+/** Bits de `meta` por celda: 0-4 = agitación del agua (pasos de flujo horizontal restantes), 5-6 = tono de color. */
+export const HEAT_MASK = 0x1f;
+export const TONE_SHIFT = 5;
+/** Variantes de tono por partícula (las mismas 4 del archivo de referencia). */
+export const TONES = 4;
+
+/** Detecta arena dentro de un rectángulo (px del mundo). Los cuerpos con colisión de arena la usan como sólida. */
+export interface SandSensor {
+  overlapsSand(x: number, y: number, w: number, h: number): boolean;
 }

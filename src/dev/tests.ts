@@ -1143,6 +1143,24 @@ function pixWorld(rand: () => number = () => 0): { w: WorldManager; px: PixelSim
   return { w, px };
 }
 
+/** Cuenca entre dos muros de piedra (celdas 32..63), con dos capas de fluido de 8 filas: aceite y agua. */
+function basin(density: number, oilOnBottom: boolean): PixelSim {
+  const w = flatWorld();
+  for (let by = 58; by <= 63; by++) {
+    w.setBlock(3, by, BlockId.STONE);
+    w.setBlock(8, by, BlockId.STONE);
+  }
+  const px = new PixelSim(w, () => 0);
+  w.onBlockChanged = (bx, by) => px.onBlockChanged(bx, by);
+  px.params.oilDensity = density;
+  px.params.rules.waterFlow = false; // se aísla la flotación del flujo horizontal
+  px.params.rules.oilFlow = false;
+  px.fillRect(32, 504, 63, 511, oilOnBottom ? PixelMat.OIL : PixelMat.WATER);
+  px.fillRect(32, 496, 63, 503, oilOnBottom ? PixelMat.WATER : PixelMat.OIL);
+  stepPx(px, 300);
+  return px;
+}
+
 function stepPx(px: PixelSim, n: number): void {
   for (let i = 0; i < n; i++) px.step();
 }
@@ -1250,14 +1268,35 @@ export function runPhase12Tests() {
       p.length === 40 && heights.size >= 6 && maxH <= 12,
     );
   }
+
+  // Arena sobre la superficie de un charco: splash lateral (olas) o SWAP
   {
-    const { px } = pixWorld();
-    px.deposit(40, 511, PixelMat.WATER);
-    px.deposit(40, 510, PixelMat.SAND);
-    px.step();
+    const sinkTest = (splash: boolean, fluid: number) => {
+      const { px } = pixWorld(mulberry32(7));
+      px.params.rules.sandSplash = splash;
+      px.fillRect(30, 500, 49, 511, fluid);
+      px.deposit(40, 499, PixelMat.SAND);
+      px.step();
+      return px;
+    };
+    const a = sinkTest(true, PixelMat.WATER);
     check(
-      'arena: se hunde en el agua e intercambia posición',
-      px.peek(40, 511) === PixelMat.SAND && px.peek(40, 510) === PixelMat.WATER,
+      'arena sobre agua: se hunde y el agua salta a un costado (splash), sin subir por el chorro',
+      a.peek(40, 500) === PixelMat.SAND &&
+        a.peek(40, 499) === 0 &&
+        (a.peek(39, 499) === PixelMat.WATER || a.peek(41, 499) === PixelMat.WATER),
+    );
+    const b = sinkTest(false, PixelMat.WATER);
+    check(
+      'arena sobre agua con el splash apagado: intercambian posición (SWAP)',
+      b.peek(40, 500) === PixelMat.SAND && b.peek(40, 499) === PixelMat.WATER,
+    );
+    const c = sinkTest(true, PixelMat.OIL);
+    check(
+      'arena sobre aceite: se hunde y el aceite salta a un costado (splash)',
+      c.peek(40, 500) === PixelMat.SAND &&
+        c.peek(40, 499) === 0 &&
+        (c.peek(39, 499) === PixelMat.OIL || c.peek(41, 499) === PixelMat.OIL),
     );
   }
 
@@ -1272,10 +1311,165 @@ export function runPhase12Tests() {
     const maxH = Math.max(...heights.values());
     check(
       `agua: una columna de 60 se reparte conservando el volumen (${heights.size} columnas, altura máx. ${maxH})`,
-      p.length === 60 && heights.size >= 12 && maxH <= 6,
+      p.length === 60 && heights.size >= 10 && maxH <= 8,
     );
     px.step();
     check('agua: el charco queda en reposo y su capa se duerme', px.activeLayers === 0);
+  }
+  // Diagonal de la arena: se puede activar y desactivar
+  {
+    const slid = (on: boolean): boolean => {
+      const { px } = pixWorld(mulberry32(2));
+      px.params.rules.sandDiagonal = on;
+      px.deposit(40, 511, PixelMat.SAND);
+      px.deposit(40, 510, PixelMat.SAND);
+      stepPx(px, 10);
+      return px.peek(40, 510) === 0 && px.countMaterial(PixelMat.SAND) === 2;
+    };
+    check('arena: con «caer en diagonal» resbala y sin ella se queda apilada', slid(true) && !slid(false));
+  }
+
+  // Flujo horizontal del agua: se agota con su agitación (rand fijo: siempre a la izquierda)
+  {
+    const a = pixWorld();
+    a.px.deposit(40, 511, PixelMat.WATER);
+    stepPx(a.px, 60);
+    check(
+      'agua: el flujo horizontal aleatorio la desplaza hasta agotar su agitación (16 pasos)',
+      a.px.peek(24, 511) === PixelMat.WATER && a.px.countMaterial(PixelMat.WATER) === 1,
+    );
+    const b = pixWorld();
+    b.px.params.rules.waterFlow = false;
+    b.px.deposit(40, 511, PixelMat.WATER);
+    stepPx(b.px, 60);
+    check('agua sin flujo horizontal: se queda donde cayó', b.px.peek(40, 511) === PixelMat.WATER);
+  }
+
+  // El tono de color viaja con la partícula
+  {
+    const { px } = pixWorld(() => 0.9);
+    px.deposit(40, 400, PixelMat.SAND);
+    const before = px.peekTone(40, 400);
+    stepPx(px, 80);
+    check(
+      'el tono de color viaja con la partícula al caer',
+      before === 3 && px.peek(40, 511) === PixelMat.SAND && px.peekTone(40, 511) === 3,
+    );
+  }
+  // Densidad del aceite
+  {
+    const floats = basin(0.8, true); // aceite debajo del agua, más ligero: sube
+    check(
+      'densidad 0,8: el aceite que está debajo del agua sube y flota',
+      floats.peek(44, 496) === PixelMat.OIL && floats.peek(44, 511) === PixelMat.WATER,
+    );
+    const sinks = basin(1.4, false); // aceite encima del agua, más denso: baja
+    check(
+      'densidad 1,4: el aceite que está sobre el agua se hunde',
+      sinks.peek(44, 511) === PixelMat.OIL && sinks.peek(44, 496) === PixelMat.WATER,
+    );
+    const top = basin(1, false);
+    const bottom = basin(1, true);
+    check(
+      'densidad 1: aceite y agua no se intercambian (cada capa se queda donde estaba)',
+      top.peek(44, 496) === PixelMat.OIL &&
+        top.peek(44, 511) === PixelMat.WATER &&
+        bottom.peek(44, 511) === PixelMat.OIL &&
+        bottom.peek(44, 496) === PixelMat.WATER,
+    );
+  }
+
+  // El aceite no reacciona con la lava (solo agua y lava se anulan)
+  {
+    const { px } = pixWorld();
+    px.deposit(40, 511, PixelMat.LAVA);
+    px.deposit(41, 511, PixelMat.OIL);
+    px.step();
+    check(
+      'aceite junto a lava: no reaccionan',
+      px.countMaterial(PixelMat.LAVA) === 1 && px.countMaterial(PixelMat.OIL) === 1,
+    );
+  }
+
+  // Humo: sube y su persistencia controla cuánto dura
+  {
+    const { px } = pixWorld();
+    px.params.rules.smokeFade = false;
+    px.deposit(40, 480, PixelMat.SMOKE);
+    stepPx(px, 20);
+    check(
+      'humo: sube una celda por tick',
+      px.peek(40, 460) === PixelMat.SMOKE && px.countMaterial(PixelMat.SMOKE) === 1,
+    );
+  }
+  {
+    const lifeTest = (life: number): number => {
+      const { px } = pixWorld(() => 0.01); // un sorteo fijo: 0,01 frente a la probabilidad por tick de disiparse
+      px.params.smokeLife = life;
+      px.deposit(40, 480, PixelMat.SMOKE);
+      stepPx(px, 100);
+      return px.countMaterial(PixelMat.SMOKE);
+    };
+    check(
+      'persistencia del humo: con vida corta desaparece y con vida larga permanece',
+      lifeTest(2) === 0 && lifeTest(30) === 1,
+    );
+  }
+
+  // Colisión del jugador con la arena
+  {
+    const { w, px } = pixWorld();
+    px.fillRect(0, 500, 30, 511, PixelMat.SAND); // 24 px de arena sobre el suelo: su superficie está en y = 1000
+    const p = new Player(w);
+    p.sand = px;
+    p.respawn(2, 40 * BLOCK_SIZE);
+    run(p, 2, IDLE);
+    check('jugador: aterriza sobre la arena sin atravesarla', p.onGround && Math.abs(p.y + p.height - 1000) < 0.2);
+  }
+  {
+    const { w, px } = pixWorld();
+    px.fillRect(30, 440, 33, 511, PixelMat.SAND); // columna de 72 px de alto: su cara izquierda está en x = 60
+    const p = new Player(w);
+    p.sand = px;
+    p.respawn(2, 60 * BLOCK_SIZE);
+    run(p, 1, IDLE);
+    run(p, 3, RIGHT);
+    check(
+      'jugador: una columna alta de arena lo detiene (cara en x = 60)',
+      Math.abs(p.x + p.width - 60) < 0.2 && p.vx === 0,
+    );
+  }
+  {
+    const { w, px } = pixWorld();
+    px.fillRect(20, 509, 200, 511, PixelMat.SAND); // 3 filas = 6 px
+    const p = new Player(w);
+    p.sand = px;
+    p.respawn(2, 60 * BLOCK_SIZE);
+    run(p, 1, IDLE);
+    run(p, 1.2, RIGHT);
+    check(
+      'jugador: sube solo un escalón de arena de 6 px (sube lo mínimo, no un bloque entero)',
+      p.onGround && p.x > 80 && Math.abs(p.y + p.height - 1018) < 0.2,
+    );
+  }
+  {
+    const { px } = pixWorld();
+    px.setReservedBox(80, 996, 12, 28); // celdas 40..45 x 498..511
+    px.deposit(42, 400, PixelMat.SAND);
+    stepPx(px, 80);
+    check(
+      'la arena no entra en la caja del jugador: se apoya encima de ella',
+      px.peek(42, 497) === PixelMat.SAND && px.peek(42, 498) === 0,
+    );
+  }
+  {
+    const { w, px } = pixWorld();
+    px.fillRect(0, 500, 30, 511, PixelMat.SAND);
+    const p = new Player(w);
+    p.sand = px;
+    p.respawn(2, 990); // enterrado
+    p.update(1 / 60, IDLE);
+    check('jugador enterrado en arena: sale por arriba', !p.isOverlapping() && p.y < 990);
   }
 
   // Agua + lava

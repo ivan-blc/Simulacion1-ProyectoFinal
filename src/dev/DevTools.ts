@@ -86,7 +86,7 @@ export class DevTools {
     this.preview = new GenPreview(host.seed);
 
     const title = el('div', 'font:bold 13px monospace;letter-spacing:1px;color:#fff', 'HERRAMIENTAS DE DESARROLLO');
-    const sub = el('div', 'color:#7d8aa8;font-size:11px', 'F1 abre y cierra este panel · solo existe con npm run dev');
+    const sub = el('div', 'color:#7d8aa8;font-size:11px', 'F2 abre y cierra este panel · solo existe con npm run dev');
 
     const tabBar = el('div', 'display:flex;gap:4px;margin:8px 0');
     const makeTab = (id: TabId, text: string): HTMLButtonElement => {
@@ -118,7 +118,7 @@ export class DevTools {
     this.refreshStatus();
 
     window.addEventListener('keydown', (e) => {
-      if (e.key === 'F1') {
+      if (e.key === 'F2') {
         e.preventDefault(); // evita la ayuda del navegador
         if (!e.repeat) this.toggle();
       }
@@ -240,6 +240,64 @@ export class DevTools {
       set: (v) => { sp.lavaEvery = v; },
       commit: () => {},
     });
+    addSlider(simSection, {
+      label: 'Agitación del agua (pasos de flujo)',
+      hint: 'Pasos de flujo horizontal aleatorio tras caer, ser desplazada o lanzada. 0 = sin flujo.',
+      min: 0,
+      max: 31,
+      step: 1,
+      get: () => sp.flowHeat,
+      set: (v) => { sp.flowHeat = v; },
+      commit: () => {},
+    });
+
+    simSection.appendChild(el('div', 'margin:8px 0 2px;color:#ffd479', 'REGLAS DE LA ARENA'));
+    this.toggleRows.push(
+      addToggle(simSection, 'Caer hacia abajo', () => sp.rules.sandFall, (v) => { sp.rules.sandFall = v; }),
+      addToggle(simSection, 'Hundirse en fluido', () => sp.rules.sandSink, (v) => { sp.rules.sandSink = v; }),
+      addToggle(simSection, 'Splash lateral (olas); apagado = SWAP', () => sp.rules.sandSplash, (v) => { sp.rules.sandSplash = v; }),
+      addToggle(simSection, 'Caer en diagonal', () => sp.rules.sandDiagonal, (v) => { sp.rules.sandDiagonal = v; }),
+    );
+    simSection.appendChild(el('div', 'margin:8px 0 2px;color:#ffd479', 'REGLAS DE LOS LÍQUIDOS'));
+    this.toggleRows.push(
+      addToggle(simSection, 'Caer hacia abajo', () => sp.rules.waterFall, (v) => { sp.rules.waterFall = v; }),
+      addToggle(simSection, 'Caer en diagonal', () => sp.rules.waterDiagonal, (v) => { sp.rules.waterDiagonal = v; }),
+      addToggle(simSection, 'Flujo horizontal (agua)', () => sp.rules.waterFlow, (v) => { sp.rules.waterFlow = v; }),
+    );
+    simSection.appendChild(el('div', 'margin:8px 0 2px;color:#ffd479', 'ACEITE'));
+    addSlider(simSection, {
+      label: 'Densidad del aceite',
+      hint: 'El agua tiene densidad 1. Menor que 1: el aceite flota (el agua se hunde bajo él). Mayor que 1: el aceite se hunde. Igual a 1: no se intercambian.',
+      min: 0.1,
+      max: 1.9,
+      step: 0.05,
+      get: () => sp.oilDensity,
+      set: (v) => { sp.oilDensity = v; },
+      commit: () => {},
+    });
+    this.toggleRows.push(
+      addToggle(simSection, 'Caer hacia abajo', () => sp.rules.oilFall, (v) => { sp.rules.oilFall = v; }),
+      addToggle(simSection, 'Caer en diagonal', () => sp.rules.oilDiagonal, (v) => { sp.rules.oilDiagonal = v; }),
+      addToggle(simSection, 'Flujo horizontal', () => sp.rules.oilFlow, (v) => { sp.rules.oilFlow = v; }),
+    );
+
+    simSection.appendChild(el('div', 'margin:8px 0 2px;color:#ffd479', 'HUMO'));
+    addSlider(simSection, {
+      label: 'Persistencia del humo (s)',
+      hint: 'Vida media del humo. Más alta = tarda más en desaparecer.',
+      min: 0.2,
+      max: 30,
+      step: 0.2,
+      get: () => sp.smokeLife,
+      set: (v) => { sp.smokeLife = v; },
+      commit: () => {},
+    });
+    this.toggleRows.push(
+      addToggle(simSection, 'Subir', () => sp.rules.smokeRise, (v) => { sp.rules.smokeRise = v; }),
+      addToggle(simSection, 'Subir en diagonal', () => sp.rules.smokeDiagonal, (v) => { sp.rules.smokeDiagonal = v; }),
+      addToggle(simSection, 'Dispersión horizontal', () => sp.rules.smokeDisperse, (v) => { sp.rules.smokeDisperse = v; }),
+      addToggle(simSection, 'Disiparse (apagado = el humo se acumula)', () => sp.rules.smokeFade, (v) => { sp.rules.smokeFade = v; }),
+    );
     addButton(simSection, 'Limpiar arena y fluidos (radio 40)', () => {
       this.flash(`Se eliminaron ${this.host.sim.clearNearby()} celdas`);
     });

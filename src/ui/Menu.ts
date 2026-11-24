@@ -1,3 +1,4 @@
+import { DEV_TOOLS } from '../config';
 import { seedFromText } from '../core/random';
 
 const OVERLAY_CSS =
@@ -87,7 +88,7 @@ export function showTitleScreen(defaultSeedText: string, onGesture: () => void):
       'A/D mover · Espacio saltar · clic izq. minar o atacar · clic der. construir<br>' +
       'Varitas (agua, arena, lava, aceite, humo): elígelas en la barra y mantén el clic izq. para lanzar<br>' +
       '1-0 elegir slot · C antorchas · Esc pausa · M música · L luz' +
-      (import.meta.env.DEV ? ' · F2 herramientas de desarrollo' : '');
+      (DEV_TOOLS ? ' · F2 herramientas de desarrollo' : '');
 
     root.append(title, subtitle, label, play, random, fresh, help);
     document.body.appendChild(root);

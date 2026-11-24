@@ -1644,3 +1644,17 @@ export function runPhase12Tests() {
     check('lava: quema a los enemigos hasta matarlos', em.enemies.length === 0);
   }
 }
+
+export function runAllTests(): void {
+  runPhase1Tests();
+  runPhase2Tests();
+  runPhase4Tests();
+  runPhase5Tests();
+  runPhase6Tests();
+  runPhase7Tests();
+  runPhase8Tests();
+  runPhase9Tests();
+  runPhase10Tests();
+  runPhase11Tests();
+  runPhase12Tests();
+}

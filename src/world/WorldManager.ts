@@ -84,6 +84,13 @@ export class WorldManager {
     this.modifiedKeys.add(key);
   }
 
+  /** Solo para pruebas: registra un chunk ya construido (sin pasar por el generador). */
+  insertChunkForTest(chunk: Chunk): void {
+    const key = chunkKey(chunk.cx, chunk.cy);
+    this.chunks.set(key, chunk);
+    this.onChunkLoaded?.(chunk);
+  }
+
   /** Cargar el agua guardada. Llamar ANTES de crear el primer chunk. */
   loadLiquid(saved: Map<string, Uint16Array>): void {
     for (const [key, layer] of saved) {
@@ -133,6 +140,7 @@ export class WorldManager {
     const next = Math.max(0, Math.min(LIQUID.MAX_LEVEL, chunk.liquid[i] + delta));
     if (next === chunk.liquid[i]) return;
     chunk.liquid[i] = next;
+    chunk.liquidVersion++;
     this.touchLiquid(chunk);
   }
 

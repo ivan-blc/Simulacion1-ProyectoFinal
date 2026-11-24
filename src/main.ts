@@ -17,6 +17,7 @@ import {
   runPhase9Tests,
   runPhase10Tests,
   runPhase11Tests,
+  runPhase12Tests,
   verifyWorkerChunk,
 } from './dev/tests';
 import { EnemyManager } from './entities/EnemyManager';
@@ -88,6 +89,7 @@ async function main() {
     runPhase9Tests();
     runPhase10Tests();
     runPhase11Tests();
+    runPhase12Tests();
   }
 
   // ?debug = mapa 2D · ?autostart = saltar el menú · ?seed=123 · ?reset = borrar guardado
@@ -650,7 +652,7 @@ async function main() {
           '── DEPURACIÓN ──',
           `fotograma más largo (0,25 s): ${frameMax.toFixed(1)} ms`,
           `luz: ${lightField.lightsCast} fuentes · ${lightField.raysCast} rayos · ${lightMs.toFixed(2)} ms · rejilla ${lightField.gw}x${lightField.gh} · muestras ${lightField.sw}x${lightField.sh} · blur ${lightRenderer.blurPasses}`,
-          `agua: ${liquid.stats.awake} celdas despiertas · ${liquid.stats.processed} procesadas · ${liquid.stats.ms.toFixed(2)} ms/tick · dibujo ${waterRenderer.stats.quads} rectángulos · ${waterRenderer.stats.ms.toFixed(2)} ms`,
+          `agua: ${liquid.stats.awake} celdas despiertas · ${liquid.stats.processed} procesadas · ${liquid.stats.ms.toFixed(2)} ms/tick · dibujo ${waterRenderer.stats.chunks} chunks · ${waterRenderer.stats.vertices} vértices · ${waterRenderer.stats.rebuilds} reconstrucciones · ${waterRenderer.stats.ms.toFixed(2)} ms`,
           `chunks: cargados ${world.loadedCount} · visibles ${chunkRenderer.visibleCount} · pendientes ${world.pendingCount}`,
           pool
             ? `workers: ${pool.size} · en cola ${pool.queued} · en curso ${pool.inFlight} · gen. media ${pool.avgMs.toFixed(2)} ms · generados ${pool.completed}`

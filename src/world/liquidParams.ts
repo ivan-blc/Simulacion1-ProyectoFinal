@@ -7,5 +7,6 @@ export const LIQUID = {
   SUBSTEPS: 1, // pasadas por tick (súbelo para que el agua reaccione más rápido)
   MAX_TICKS_PER_FRAME: 2, // evita "espirales" si un fotograma tarda mucho
   CELL_BUDGET: 6000, // celdas procesadas por tick como máximo
+  FALL_CAP: 256, // agua máxima que pasa de una celda a la de abajo por tick: estira un grumo en un chorro
   LIGHT_ABSORPTION: 0.12, // fracción de luz que absorbe una celda llena de agua
 } as const;

@@ -14,6 +14,9 @@ export class Chunk {
   awakeCount = 0;
   /** El agua de este chunk cambió y está pendiente de guardar. */
   liquidDirty = false;
+  /** Suben con cada cambio de agua o de bloque: el dibujo del agua se reconstruye solo si cambian. */
+  liquidVersion = 0;
+  blockVersion = 0;
 
   constructor(cx: number, cy: number) {
     this.cx = cx;
@@ -30,6 +33,7 @@ export class Chunk {
     if (this.blocks[i] === id) return false;
     this.blocks[i] = id;
     this.isDirty = true;
+    this.blockVersion++;
     return true;
   }
 }

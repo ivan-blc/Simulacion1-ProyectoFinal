@@ -19,6 +19,12 @@ export const GEN = {
 
   // Agua
   WATER_LEVEL: 68,         // Y del bloque de agua más alto de un lago (la superficie oscila en 64 ± 18)
+
+  // Charcos en las cuevas: cuencas cerradas del suelo que nacen ya en equilibrio
+  PUDDLE_CHANCE: 0.4,      // probabilidad de que una cuenca cerrada tenga agua
+  PUDDLE_MIN_DEPTH: 20,    // bloques bajo la superficie a partir de los cuales puede haber charcos
+  PUDDLE_MAX_WIDTH: 8,     // ancho máximo de la cuenca (en bloques)
+  PUDDLE_MAX_ROWS: 3,      // filas máximas de agua apiladas
 } as const;
 /** Minerales: aparecen donde el ruido supera el umbral y a partir de minDepth bloques bajo la superficie. */
 export const ORES = [

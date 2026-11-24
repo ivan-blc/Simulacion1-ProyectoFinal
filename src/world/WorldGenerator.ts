@@ -7,6 +7,7 @@ import { LIQUID } from './liquidParams';
 
 const CAVE_SALT = 0x5bd1e995;
 const DIRT_SALT = 7;
+const PUDDLE_SALT = 0x2f6e2b1;
 
 const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
 
@@ -161,6 +162,7 @@ export class WorldGenerator {
     }
 
     this.fillWater(chunk, heights);
+    this.fillCavePuddles(chunk, heights);
   }
 
   /**
@@ -177,6 +179,69 @@ export class WorldGenerator {
       for (let by = top; by <= bottom; by++) {
         chunk.liquid[(by - y0) * CHUNK_SIZE + lx] = LIQUID.MAX_LEVEL;
       }
+    }
+  }
+
+  /**
+   * Charcos en las cuevas. Una CUENCA es un tramo horizontal de aire, con suelo sólido debajo de cada
+   * celda y pared a ambos lados, dentro del chunk. Con probabilidad PUDDLE_CHANCE (decidida por un
+   * hash de su posición) se llena con agua ya EN EQUILIBRIO: filas llenas abajo y una fila superior
+   * uniforme. Así LiquidSim no tiene nada que mover, no hay que guardar nada y no hay costuras:
+   * una cuenca que cruza el límite de un chunk no se siembra en ninguno de los dos.
+   */
+  private fillCavePuddles(chunk: Chunk, heights: number[]): void {
+    const N = CHUNK_SIZE;
+    const lastY = chunk.cy * N + N - 1;
+    let minH = Infinity;
+    for (const h of heights) if (h < minH) minH = h;
+    if (lastY - minH < GEN.PUDDLE_MIN_DEPTH) return; // ni una sola celda está lo bastante honda
+
+    const blocks = chunk.blocks;
+    const isAir = (lx: number, ly: number): boolean => blocks[ly * N + lx] === BlockId.AIR;
+    const isSolid = (lx: number, ly: number): boolean => blocks[ly * N + lx] !== BlockId.AIR;
+
+    for (let ly = 0; ly < N - 1; ly++) { // la fila inferior no se mira: su suelo está en otro chunk
+      let lx = 0;
+      while (lx < N) {
+        if (!isAir(lx, ly) || !isSolid(lx, ly + 1)) {
+          lx++;
+          continue;
+        }
+        let e = lx; // último bloque del tramo
+        while (e + 1 < N && isAir(e + 1, ly) && isSolid(e + 1, ly + 1)) e++;
+        const len = e - lx + 1;
+        const walled = lx > 0 && e + 1 < N && isSolid(lx - 1, ly) && isSolid(e + 1, ly);
+        if (walled && len >= 2 && len <= GEN.PUDDLE_MAX_WIDTH) {
+          const bx = chunk.cx * N + lx;
+          const by = chunk.cy * N + ly;
+          if (by - heights[lx] >= GEN.PUDDLE_MIN_DEPTH && hash2D(bx, by, this.seed ^ PUDDLE_SALT) < GEN.PUDDLE_CHANCE) {
+            this.fillBasin(chunk, lx, e, ly, bx, by);
+          }
+        }
+        lx = e + 1;
+      }
+    }
+  }
+
+  /** Llena una cuenca [lx..e] cuyo suelo está en la fila `ly`: filas llenas abajo y una fila superior parcial uniforme. */
+  private fillBasin(chunk: Chunk, lx: number, e: number, ly: number, bx: number, by: number): void {
+    const N = CHUNK_SIZE;
+    const blocks = chunk.blocks;
+    // Cuántas filas están igual de encerradas (mismo ancho, aire y paredes a ambos lados)
+    let rows = 1;
+    while (rows < GEN.PUDDLE_MAX_ROWS) {
+      const r = ly - rows;
+      if (r < 0) break;
+      let ok = blocks[r * N + lx - 1] !== BlockId.AIR && blocks[r * N + e + 1] !== BlockId.AIR;
+      for (let x = lx; x <= e && ok; x++) if (blocks[r * N + x] !== BlockId.AIR) ok = false;
+      if (!ok) break;
+      rows++;
+    }
+    const used = 1 + Math.floor(hash2D(bx, by, (this.seed ^ PUDDLE_SALT) + 1) * rows); // 1..rows
+    const topFill = 0.3 + 0.7 * hash2D(bx, by, (this.seed ^ PUDDLE_SALT) + 2); // nivel de la fila superior
+    for (let k = 0; k < used; k++) {
+      const level = k === used - 1 ? Math.round(LIQUID.MAX_LEVEL * topFill) : LIQUID.MAX_LEVEL;
+      for (let x = lx; x <= e; x++) chunk.liquid[(ly - k) * N + x] = level;
     }
   }
 }

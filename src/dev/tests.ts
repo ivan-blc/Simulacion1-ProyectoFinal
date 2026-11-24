@@ -30,10 +30,24 @@ import {
   LayerBuffers,
   SAMPLE_N,
   buildSmoothLayers,
+  CASES,
+  PX,
+  PY,
   caseArea,
   cellSkyMask,
   layerArea,
+  ranksFromSamples,
 } from '../render/smoothing';
+import {
+  WaterGrid,
+  airArea,
+  buildWaterGeometry,
+  flatPolygonArea,
+  isFallingCell,
+  stripWidthPx,
+  waterCellPolygons,
+  type WaterSink,
+} from '../render/waterSmoothing';
 
 
 
@@ -1355,5 +1369,331 @@ export function runPhase11Tests() {
     const a = lit(dryWorld);
     const b = lit(wetWorld);
     check(`luz: el agua absorbe parte de la luz que la atraviesa (${a.toFixed(2)} sin agua, ${b.toFixed(2)} con agua)`, b < a && b > 0);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fase 12: agua suavizada, chorros y charcos en cuevas (ver docs/MEJORAS_AGUA.md)
+// ---------------------------------------------------------------------------------------------
+
+type Poly = { pts: number[]; lx: number; ly: number; band: boolean };
+
+/** Recoge los polígonos y las tiras que genera buildWaterGeometry. */
+function collectWater(world: WorldManager, cx: number, cy: number, withBand = true) {
+  const grid = new WaterGrid();
+  grid.load(cx, cy, (x, y) => world.getChunk(x, y));
+  const polys: Poly[] = [];
+  const strips: Array<{ lx: number; ly: number; level: number }> = [];
+  const sink: WaterSink = {
+    polygon(pts, n, lx, ly, band) {
+      polys.push({ pts: Array.from(pts.subarray(0, 2 * n)), lx, ly, band });
+    },
+    strip(lx, ly, level) {
+      strips.push({ lx, ly, level });
+    },
+  };
+  buildWaterGeometry(grid, sink, withBand);
+  return { grid, polys, strips };
+}
+
+/** ¿Está el punto (X, Y), en bloques, dentro del terreno suavizado de este chunk? */
+function insideSmoothedSolid(chunk: Chunk, X: number, Y: number): boolean {
+  const solid = (x: number, y: number) =>
+    x < 0 || y < 0 || x >= CHUNK_SIZE || y >= CHUNK_SIZE ? 0 : isSolidBlock(chunk.blocks[y * CHUNK_SIZE + x]) ? 1 : 0;
+  const cx = Math.floor(X - 0.5);
+  const cy = Math.floor(Y - 0.5);
+  const m = (solid(cx, cy) << 3) | (solid(cx + 1, cy) << 2) | (solid(cx + 1, cy + 1) << 1) | solid(cx, cy + 1);
+  const idx = CASES[m];
+  if (idx.length === 0) return false;
+  const u = X - 0.5 - cx;
+  const v = Y - 0.5 - cy;
+  let area = 0;
+  for (let k = 0; k < idx.length; k++) {
+    const j = (k + 1) % idx.length;
+    area += PX[idx[k]] * PY[idx[j]] - PX[idx[j]] * PY[idx[k]];
+  }
+  const o = area >= 0 ? 1 : -1;
+  for (let k = 0; k < idx.length; k++) {
+    const a = idx[k];
+    const b = idx[(k + 1) % idx.length];
+    if (o * ((PX[b] - PX[a]) * (v - PY[a]) - (PY[b] - PY[a]) * (u - PX[a])) < -1e-12) return false;
+  }
+  return true;
+}
+
+/** Cuenco con un lago: suelo en forma de V suave, agua desde la fila `top` (y una fila parcial encima). */
+function bowlLake(partial: number, leftPartial?: number) {
+  const chunk = new Chunk(0, 0);
+  const MAXL = LIQUID.MAX_LEVEL;
+  const ground = (x: number) => 14 + Math.round(10 * Math.max(0, 1 - Math.abs(x - 16) / 11));
+  const top = 17;
+  for (let y = 0; y < CHUNK_SIZE; y++) {
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+      if (y >= ground(x)) {
+        chunk.blocks[y * CHUNK_SIZE + x] = BlockId.STONE;
+      } else if (y >= top) {
+        chunk.liquid[y * CHUNK_SIZE + x] = MAXL;
+      } else if (y === top - 1 && partial > 0) {
+        chunk.liquid[y * CHUNK_SIZE + x] = Math.round(MAXL * (leftPartial !== undefined && x < 16 ? leftPartial : partial));
+      }
+    }
+  }
+  // Superficie analítica de cada columna y su interpolación lineal entre centros de bloque
+  const colS: number[] = [];
+  for (let x = 0; x < CHUNK_SIZE; x++) {
+    let s = Infinity;
+    for (let y = 0; y < CHUNK_SIZE && s === Infinity; y++) {
+      const lv = chunk.liquid[y * CHUNK_SIZE + x];
+      if (lv > 0) s = y + 1 - lv / MAXL;
+    }
+    colS.push(s);
+  }
+  const surfaceAt = (X: number) => {
+    const t = Math.max(0.5, Math.min(CHUNK_SIZE - 0.5, X)) - 0.5;
+    const i = Math.min(CHUNK_SIZE - 2, Math.floor(t));
+    const a = colS[i];
+    const b = colS[i + 1];
+    if (a === Infinity) return b;
+    if (b === Infinity) return a;
+    return a + (b - a) * (t - i);
+  };
+  const world = new WorldManager(() => {});
+  world.insertChunkForTest(chunk);
+  return { world, chunk, surfaceAt };
+}
+
+export function runPhase12Tests() {
+  const MAX = LIQUID.MAX_LEVEL;
+
+  // --- Geometría del agua suavizada ---
+  {
+    let ok = true;
+    for (let m = 0; m < 16; m++) if (Math.abs(airArea(m) + caseArea(m) - 1) > 1e-9) ok = false;
+    check('agua suave: aire + sólido = celda completa en los 16 casos (incluidas las sillas 5 y 10)', ok);
+
+    const ids = Object.values(BlockId) as number[];
+    const ranks = new Uint8Array(ids.length);
+    ranksFromSamples(Uint8Array.from(ids), ranks);
+    check(
+      'agua suave: el sólido del agua coincide con el rango >= 1 del terreno suavizado',
+      ids.every((id, i) => (ranks[i] > 0) === isSolidBlock(id)),
+    );
+
+    check(
+      'agua suave: una celda totalmente dentro del agua y sin terreno es el cuadrado completo',
+      (() => {
+        const p = waterCellPolygons([1, 1, 1, 1], 0);
+        return p.length === 1 && Math.abs(flatPolygonArea(p[0]) - 1) < 1e-9;
+      })(),
+    );
+    check('agua suave: una celda totalmente seca no genera polígonos', waterCellPolygons([-1, -1, -1, -1], 0).length === 0);
+    check('agua suave: una celda totalmente sólida no genera polígonos', waterCellPolygons([1, 1, 1, 1], 15).length === 0);
+
+    // Dos celdas vecinas calculan los mismos puntos sobre su arista común (sin grietas)
+    let seamsOk = true;
+    const rnd = (k: number) => Math.sin(k * 12.9898) * 0.9;
+    for (let t = 0; t < 200; t++) {
+      const v = Array.from({ length: 6 }, (_, k) => rnd(t * 7 + k));
+      // horizontales: A = [a0, s1, s2, a3], B = [s1, b1, b2, s2]
+      const A = waterCellPolygons([v[0], v[1], v[2], v[3]], 0);
+      const B = waterCellPolygons([v[1], v[4], v[5], v[2]], 0);
+      const edgeA = A.flatMap((p) => p.map((_, k) => k).filter((k) => k % 2 === 0 && Math.abs(p[k] - 1) < 1e-12).map((k) => p[k + 1]));
+      const edgeB = B.flatMap((p) => p.map((_, k) => k).filter((k) => k % 2 === 0 && Math.abs(p[k]) < 1e-12).map((k) => p[k + 1]));
+      const sa = Array.from(new Set(edgeA.map((y) => y.toFixed(9)))).sort();
+      const sb = Array.from(new Set(edgeB.map((y) => y.toFixed(9)))).sort();
+      if (sa.join() !== sb.join()) seamsOk = false;
+    }
+    check('agua suave: dos celdas vecinas coinciden sobre su arista común (sin grietas)', seamsOk);
+  }
+
+  // Lagos en un cuenco: el área de los polígonos coincide con una referencia por muestreo fino
+  for (const [name, partial, left] of [
+    ['superficie justo en el borde de un bloque', 0, undefined],
+    ['superficie a mitad de bloque (nivel 0,4)', 0.4, undefined],
+    ['superficie inclinada (0,8 a la izquierda y 0,3 a la derecha)', 0.3, 0.8],
+  ] as const) {
+    const { world, chunk, surfaceAt } = bowlLake(partial, left);
+    const { polys } = collectWater(world, 0, 0, false);
+    const body = polys.filter((p) => !p.band);
+    const total = body.reduce((a, p) => a + flatPolygonArea(p.pts), 0);
+    let ref = 0;
+    const step = 0.05;
+    for (let Y = 0.5 + step / 2; Y < 31.5; Y += step) {
+      for (let X = 0.5 + step / 2; X < 31.5; X += step) {
+        if (Y >= surfaceAt(X) && !insideSmoothedSolid(chunk, X, Y)) ref += step * step;
+      }
+    }
+    let inside = 0;
+    for (const p of body) {
+      let cX = 0;
+      let cY = 0;
+      for (let k = 0; k < p.pts.length; k += 2) {
+        cX += p.pts[k];
+        cY += p.pts[k + 1];
+      }
+      cX = p.lx + 0.5 + cX / (p.pts.length / 2);
+      cY = p.ly + 0.5 + cY / (p.pts.length / 2);
+      if (insideSmoothedSolid(chunk, cX, cY)) inside++;
+    }
+    const rel = Math.abs(total - ref) / ref;
+    check(
+      `agua suave: cuenco, ${name}: ${total.toFixed(2)} frente a ${ref.toFixed(2)} bloques² (${(rel * 100).toFixed(2)} %)`,
+      rel < 0.01 && inside === 0,
+    );
+  }
+
+  // Banda de la superficie: queda dentro del agua y dentro del aire
+  {
+    const { world, chunk } = bowlLake(0.4);
+    const { polys } = collectWater(world, 0, 0, true);
+    const band = polys.filter((p) => p.band);
+    const bandArea = band.reduce((a, p) => a + flatPolygonArea(p.pts), 0);
+    let inside = 0;
+    for (const p of band) {
+      let cX = 0;
+      let cY = 0;
+      for (let k = 0; k < p.pts.length; k += 2) {
+        cX += p.pts[k];
+        cY += p.pts[k + 1];
+      }
+      if (insideSmoothedSolid(chunk, p.lx + 0.5 + cX / (p.pts.length / 2), p.ly + 0.5 + cY / (p.pts.length / 2))) inside++;
+    }
+    check(
+      `agua suave: la banda de superficie existe (${band.length} polígonos, ${bandArea.toFixed(2)} bloques²) y no entra en el terreno`,
+      band.length > 0 && inside === 0 && bandArea > 0,
+    );
+  }
+
+  // --- Celdas en caída: tiras ---
+  check(
+    'chorro: isFallingCell (agua con aire o agua parcial debajo cae; sobre suelo o sobre agua llena, no)',
+    isFallingCell(300, false, 0) && isFallingCell(300, false, 500) && !isFallingCell(300, true, 0) && !isFallingCell(300, false, MAX) && !isFallingCell(0, false, 0),
+  );
+  check(
+    `chorro: ancho de la tira de 3 a 12 px según el nivel (${stripWidthPx(0)}, ${stripWidthPx(MAX / 4)}, ${stripWidthPx(MAX)})`,
+    stripWidthPx(0) === 3 && Math.abs(stripWidthPx(MAX / 4) - 7.5) < 1e-9 && stripWidthPx(MAX / 2) === 12 && stripWidthPx(MAX) === 12,
+  );
+  {
+    const { world } = waterWorld((_c, set) => {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) for (let ly = 30; ly < CHUNK_SIZE; ly++) set(lx, ly, BlockId.STONE);
+    });
+    world.getOrCreateChunk(0, 0);
+    world.addLiquid(10, 5, 256); // agua en el aire: cae
+    for (let y = 25; y < 30; y++) world.addLiquid(20, y, MAX); // lago apoyado en el suelo
+    world.addLiquid(20, 24, 300); // fila parcial encima del lago: no cae
+    const { grid, polys, strips } = collectWater(world, 0, 0, false);
+    const own = WaterGrid.index(10, 5);
+    check(
+      'chorro: una celda en el aire genera una tira con su nivel y no entra en el campo de la superficie',
+      strips.length === 1 && strips[0].lx === 10 && strips[0].ly === 5 && strips[0].level === 256 && grid.fill[own] === 0,
+    );
+    check(
+      'chorro: el lago y su fila parcial no generan tiras, y sí polígonos',
+      !strips.some((s) => s.lx === 20) && polys.some((p) => p.lx >= 19 && p.lx <= 20 && p.ly >= 23),
+    );
+  }
+
+  // --- Chorros: el tope de caída estira el grumo en una columna continua ---
+  {
+    const { world, sim } = waterWorld((_c, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) for (let lx = 0; lx < CHUNK_SIZE; lx++) if (lx === 9 || lx === 11 || ly >= 30) set(lx, ly, BlockId.STONE);
+    });
+    world.getOrCreateChunk(0, 0);
+    world.addLiquid(10, 5, MAX);
+    wakeAll(sim, world);
+    sim.update(1 / LIQUID.TICK_HZ);
+    check(
+      `chorro: en un tick solo pasan FALL_CAP (${LIQUID.FALL_CAP}) unidades a la celda de abajo`,
+      world.getLiquid(10, 6) === LIQUID.FALL_CAP && world.getLiquid(10, 5) === MAX - LIQUID.FALL_CAP,
+    );
+
+    const w2 = waterWorld((_c, set) => {
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) for (let lx = 0; lx < CHUNK_SIZE; lx++) if (lx === 9 || lx === 11 || ly >= 30) set(lx, ly, BlockId.STONE);
+    });
+    w2.world.getOrCreateChunk(0, 0);
+    w2.world.addLiquid(10, 0, MAX);
+    wakeAll(w2.sim, w2.world);
+    let ticks = 0;
+    let reached = -1;
+    let maxRun = 0;
+    while (awakeTotal(w2.world) > 0 && ticks < 500) {
+      w2.sim.update(1 / LIQUID.TICK_HZ);
+      ticks++;
+      let run = 0;
+      for (let y = 0; y < 29; y++) {
+        if (w2.world.getLiquid(10, y) > 0) maxRun = Math.max(maxRun, ++run);
+        else run = 0;
+      }
+      if (reached < 0 && w2.world.getLiquid(10, 29) > 0) reached = ticks;
+    }
+    const expected = Math.ceil(MAX / LIQUID.FALL_CAP);
+    check(`chorro: un grumo cae como una columna continua de ${expected} celdas (máximo observado: ${maxRun})`, maxRun === expected);
+    check(`chorro: el agua llega al suelo en ${reached} ticks (igual que sin tope: una celda por tick)`, reached > 0 && reached <= 30);
+    check(
+      `chorro: se asienta (${ticks} ticks), duerme y conserva todo el volumen en la celda del fondo`,
+      awakeTotal(w2.world) === 0 && w2.world.getLiquid(10, 29) === MAX && liquidTotal(w2.world) === MAX,
+    );
+  }
+
+  // --- Charcos en las cuevas: cuencas cerradas, ya en equilibrio ---
+  {
+    const SEED = 12345;
+    const gen = new WorldGenerator(SEED);
+    const sim0 = (w: WorldManager) => {
+      const sim = new LiquidSim(w);
+      w.onChunkLoaded = (c) => sim.onChunkLoaded(c);
+      return sim;
+    };
+    const world = new WorldManager((c) => gen.generateChunk(c));
+    const sim = sim0(world);
+    const region: Chunk[] = [];
+    for (let cx = -3; cx <= 3; cx++) for (let cy = 3; cy <= 7; cy++) region.push(world.getOrCreateChunk(cx, cy));
+    const N = CHUNK_SIZE;
+
+    let cells = 0;
+    let chunksWith = 0;
+    let validRows = true;
+    let atEdge = 0;
+    for (const c of region) {
+      let n = 0;
+      for (let ly = 0; ly < N; ly++) {
+        for (let lx = 0; lx < N; lx++) {
+          const lv = c.liquid[ly * N + lx];
+          if (lv === 0) continue;
+          n++;
+          cells++;
+          if (lx === 0 || lx === N - 1) atEdge++;
+          if (isSolidBlock(c.blocks[ly * N + lx])) validRows = false;
+          // debajo: sólido o agua
+          if (ly + 1 < N && !isSolidBlock(c.blocks[(ly + 1) * N + lx]) && c.liquid[(ly + 1) * N + lx] === 0) validRows = false;
+          // los extremos de cada tramo de agua de la fila tienen pared
+          if (lx === 0 || lx === N - 1) continue;
+          const left = c.liquid[ly * N + lx - 1] === 0;
+          const right = c.liquid[ly * N + lx + 1] === 0;
+          if (left && !isSolidBlock(c.blocks[ly * N + lx - 1])) validRows = false;
+          if (right && !isSolidBlock(c.blocks[ly * N + lx + 1])) validRows = false;
+          // la fila de arriba solo tiene agua si esta está llena
+          if (ly > 0 && c.liquid[(ly - 1) * N + lx] > 0 && lv !== LIQUID.MAX_LEVEL) validRows = false;
+        }
+      }
+      if (n > 0) chunksWith++;
+    }
+    check(`charcos: hay agua en cuevas profundas (${cells} celdas en ${chunksWith} de ${region.length} chunks)`, cells > 0 && chunksWith > 0);
+    check('charcos: cada fila de agua está bordeada de pared, tiene suelo o agua debajo y solo se apila sobre filas llenas', validRows);
+    check('charcos: ninguna cuenca toca el borde del chunk (una que cruzase el límite no se siembra)', atEdge === 0);
+
+    const a = new Chunk(0, 5);
+    const b = new Chunk(0, 5);
+    gen.generateChunk(a);
+    new WorldGenerator(SEED).generateChunk(b);
+    check('charcos: la misma semilla genera los mismos charcos', sameArray(a.liquid, b.liquid));
+
+    for (let t2 = 0; t2 < 3; t2++) sim.update(1 / LIQUID.TICK_HZ);
+    check(
+      'charcos: tras cargar la región, todo duerme en 3 ticks (ya nacen en equilibrio)',
+      awakeTotal(world) === 0,
+    );
+    check('charcos: y no hay nada que guardar (el agua no cambió)', world.takeModifiedLiquid().length === 0);
+
   }
 }

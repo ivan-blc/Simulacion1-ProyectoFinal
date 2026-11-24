@@ -11,7 +11,8 @@ const DIRS_B = [1, -1] as const;
  * Agua como autómata celular por niveles (0..LIQUID.MAX_LEVEL por celda).
  *
  * Reglas, por celda despierta y en este orden:
- *  1. caer: si abajo no hay un bloque sólido y la celda no está llena, se le pasa agua.
+ *  1. caer: si abajo no hay un bloque sólido y la celda no está llena, se le pasa agua (como mucho
+ *     FALL_CAP por tick, para que un grumo se estire en un chorro continuo).
  *  2. repartirse: si ya no puede caer más, iguala el nivel con las vecinas laterales.
  *  3. evaporar: una capa muy fina sobre suelo sólido desaparece.
  *  4. dormir: si no se movió nada, la celda deja de costar tiempo.
@@ -122,7 +123,7 @@ export class LiquidSim {
     if (!belowBlocked) {
       const below = w.getLiquid(bx, by + 1);
       if (below < MAX) {
-        const f = Math.min(level, MAX - below);
+        const f = Math.min(level, MAX - below, LIQUID.FALL_CAP);
         this.transfer(bx, by, bx, by + 1, f);
         level -= f;
         moved = true;

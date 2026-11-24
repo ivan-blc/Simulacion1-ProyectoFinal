@@ -32,6 +32,7 @@ import { WorldManager } from './world/WorldManager';
 import { DEFAULT_GEN_PARAMS, cloneGenParams } from './world/genParams';
 import type { GenParams } from './world/genParams';
 import { torchHasSupport } from './world/torchRules';
+import { DEV_TOOLS } from './config';
 
 const CHUNK_PX = CHUNK_SIZE * BLOCK_SIZE;
 const ATTACK_DAMAGE = 10;
@@ -70,13 +71,15 @@ function writeLastSeed(text: string): void {
 let loadingScreen: LoadingScreen | null = null;
 
 async function main() {
-  // Herramientas de desarrollo: solo existen con `npm run dev`; Vite las elimina del build de producción
-  const dev = import.meta.env.DEV ? await import('./dev/devSetup') : null;
-  dev?.runAllTests();
-
   // ?autostart = saltar el menú · ?seed=123 · ?reset = borrar guardado · ?noworker = sin Web Workers
-  // ?debug = mapa 2D (solo en desarrollo)
+  // ?debug = mapa 2D · ?tests = pruebas automáticas · ?defaults = ignorar las reglas guardadas del panel
   const params = new URLSearchParams(location.search);
+
+  // Herramientas de desarrollo (F1): también en la build pública, en un paquete aparte
+  const dev = DEV_TOOLS ? await import('./dev/devSetup') : null;
+  // Pruebas automáticas: solo con `npm run dev` o ?tests (los jugadores no las necesitan)
+  const tests = import.meta.env.DEV || params.has('tests') ? await import('./dev/tests') : null;
+  tests?.runAllTests();
 
   if (dev && params.has('debug')) {
     dev.showDebugMap(seedFromText(params.get('seed'), 12345), dev.loadDevConfig().gen);
@@ -120,7 +123,7 @@ async function main() {
   document.body.appendChild(app.canvas);
 
   // Reglas de generación: en desarrollo se recuperan las que guardó el panel
-  const devConfig = dev ? dev.loadDevConfig() : null;
+  const devConfig = dev && !params.has('defaults') ? dev.loadDevConfig() : null;
   const genParams: GenParams = devConfig ? devConfig.gen : cloneGenParams(DEFAULT_GEN_PARAMS);
   const gen = new WorldGenerator(seed, genParams);
   const world = new WorldManager((chunk) => gen.generateChunk(chunk));
@@ -294,9 +297,9 @@ async function main() {
         params: genParams,
         size: Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 4) - 1)),
         onResult: (cx, cy, blocks, ms) => {
-          if (dev && verified < 3) {
+          if (tests && verified < 3) {
             verified++;
-            dev.verifyWorkerChunk(gen, cx, cy, blocks, ms);
+            tests.verifyWorkerChunk(gen, cx, cy, blocks, ms);
           }
           world.insertGenerated(cx, cy, blocks);
         },

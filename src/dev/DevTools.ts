@@ -86,7 +86,7 @@ export class DevTools {
     this.preview = new GenPreview(host.seed);
 
     const title = el('div', 'font:bold 13px monospace;letter-spacing:1px;color:#fff', 'HERRAMIENTAS DE DESARROLLO');
-    const sub = el('div', 'color:#7d8aa8;font-size:11px', 'F2 abre y cierra este panel · solo existe con npm run dev');
+    const sub = el('div', 'color:#7d8aa8;font-size:11px', 'F2 abre y cierra este panel');
 
     const tabBar = el('div', 'display:flex;gap:4px;margin:8px 0');
     const makeTab = (id: TabId, text: string): HTMLButtonElement => {
